@@ -5458,6 +5458,311 @@ These questions should be answered before Codex is asked to build.
 
 ---
 
+### 16.13 Recommended architecture decisions - draft
+
+This subsection provides draft answers to the remaining architecture blockers so engineering planning can begin. These are recommended defaults, not irreversible decisions.
+
+#### 16.13.1 Platform decision
+
+Recommended MVP platform:
+
+* **Mobile-first app using React Native / Expo with TypeScript**
+
+Rationale:
+
+* The app is primarily used during workouts, which is a phone-first context.
+* Workout logging, reminders, and quick nutrition logging are better suited to mobile than desktop.
+* The target user should be able to use the app at the gym, at home, and between sets.
+* React Native / Expo keeps the stack close to React/TypeScript skills while supporting native mobile behavior.
+
+Alternative:
+
+* A mobile-first web app/PWA can be used if speed of prototyping matters more than native mobile UX.
+
+Decision:
+
+* Treat mobile as the primary UX target.
+* Web/admin views can be post-MVP unless needed for development/testing.
+
+---
+
+#### 16.13.2 Frontend stack decision
+
+Recommended frontend stack:
+
+* React Native
+* Expo
+* TypeScript
+* Expo Router or equivalent routing
+* Local persistence for in-progress workout drafts
+
+Frontend requirements:
+
+* Support phone-first layouts.
+* Support fast set logging with minimal taps.
+* Preserve workout draft data locally.
+* Handle offline/interrupted workout state.
+* Keep UI simple for beginner/intermediate users.
+
+---
+
+#### 16.13.3 Backend/database decision
+
+Recommended MVP backend approach:
+
+* Supabase for Auth, Postgres database, and server-side data access patterns
+
+Rationale:
+
+* The product has relational data: users, plan versions, workout sessions, set logs, exercise instances, recommendations, food logs, and equipment calendars.
+* Postgres fits the domain better than a purely document-first database.
+* Auth + database integration can reduce setup overhead for an MVP.
+* Row-level security can help enforce user-scoped access.
+
+Alternative:
+
+* Custom Node/Express or Next.js backend with Postgres.
+* Firebase if prioritizing client velocity over relational modeling, but this app’s domain is naturally relational.
+
+Decision:
+
+* Use a relational database as the canonical source of truth.
+* Prefer Postgres-based implementation for MVP.
+
+---
+
+#### 16.13.4 Auth provider decision
+
+Recommended MVP auth:
+
+* Supabase Auth or equivalent managed auth provider
+* Email/password first
+* Google/Apple sign-in as optional fast-follow depending on platform requirements
+
+Auth requirements:
+
+* User-scoped data access
+* Secure session handling
+* Password reset
+* Account deletion request flow
+* No support/admin impersonation in MVP Core
+
+---
+
+#### 16.13.5 Plan generation location decision
+
+Recommended MVP decision:
+
+* Run canonical plan generation server-side.
+
+Rationale:
+
+* Keeps business rules consistent across clients.
+* Makes rule updates easier without app-store redeploys.
+* Protects generator logic from diverging between devices.
+* Simplifies auditability and debugging.
+
+Client responsibility:
+
+* Collect onboarding inputs.
+* Display generated plan.
+* Allow edits/substitutions.
+* Preserve in-progress workout logs locally.
+
+Server responsibility:
+
+* Validate inputs.
+* Run plan generator.
+* Create PlanVersion, WorkoutDay, and ExerciseInstance records.
+* Return plan explanation and validation warnings.
+
+MVP rule:
+
+* The client may have lightweight local validation, but server-side generator output is canonical.
+
+---
+
+#### 16.13.6 Exercise database launch size
+
+Recommended MVP seed target:
+
+* 75 to 125 high-quality exercises
+
+Minimum viable coverage:
+
+* Full gym
+* Dumbbells only
+* Bodyweight only
+* Bands/basic home equipment where feasible
+* Major movement patterns
+* Common beginner/intermediate substitutions
+
+Exercise database priorities:
+
+1. Metadata accuracy over quantity
+2. Common exercises over niche variations
+3. Substitution reliability
+4. Equipment compatibility
+5. Beginner/intermediate suitability
+
+MVP note:
+
+* A smaller high-quality database is better than a large inconsistent one.
+
+---
+
+#### 16.13.7 Nutrition formula decision
+
+Recommended MVP approach:
+
+* Use a simple estimated maintenance calorie formula.
+* Apply goal-based adjustment for bulk/cut/recomp.
+* Allow manual override.
+* Treat calculated targets as starting estimates, not precise prescriptions.
+
+Suggested target behavior:
+
+* Bulk: small calorie surplus
+* Cut: moderate calorie deficit
+* Recomp: near maintenance
+* Protein: use a body-weight-based target
+* Fats/carbs: allocate after protein and calorie target
+
+MVP requirement:
+
+* The app must clearly explain that nutrition targets are estimates and can be edited.
+
+Open detail:
+
+* Exact formula should be chosen before implementation.
+
+---
+
+#### 16.13.8 Strict nutrition decision
+
+Recommended MVP Core decision:
+
+* Lite nutrition is MVP Core.
+* Strict nutrition search is MVP Extended unless launch strategy requires it.
+
+Rationale:
+
+* Lite nutrition proves the adherence loop without being blocked by provider complexity.
+* Strict food search introduces provider normalization, API reliability, caching, serving-size complexity, and UX edge cases.
+* Saved meals and macro shortcuts fit the beginner/intermediate target user well.
+
+MVP Core nutrition requirements:
+
+* Daily macro targets
+* Protein/calorie progress
+* Saved meals
+* Quick-add macro entries
+* Edit/delete nutrition logs
+
+MVP Extended strict nutrition:
+
+* Food database search
+* Provider lookup
+* Custom food entries
+* Recent foods
+* Provider fallback handling
+
+---
+
+#### 16.13.9 First nutrition provider decision
+
+If strict nutrition ships early, recommended first provider:
+
+* USDA FoodData Central for structured food data
+
+Potential fast-follow:
+
+* Open Food Facts for packaged/barcode-style coverage
+
+MVP rule:
+
+* Do not depend on provider data for the core product loop.
+* Always allow manual or saved-meal fallback.
+
+---
+
+#### 16.13.10 Data retention and deletion decision
+
+Recommended MVP policy draft:
+
+* User can request account deletion from settings.
+* Account deletion should delete or anonymize user-owned workout, nutrition, body metric, and profile data according to the final legal/privacy policy.
+* Soft-delete user logs initially for accidental recovery and audit integrity.
+* Exclude soft-deleted records from recommendations and progress calculations.
+* Define a hard-deletion/anonymization window before public launch.
+
+MVP placeholder SLA:
+
+* Final deletion/anonymization timeline must be defined before production release.
+
+---
+
+#### 16.13.11 Admin/support access decision
+
+Recommended MVP Core decision:
+
+* No admin/support access to individual user data in MVP Core unless absolutely necessary.
+
+Rationale:
+
+* Reduces privacy/compliance complexity.
+* Reduces permission-model complexity.
+* Keeps the first build user-scoped.
+
+If support tooling is added later:
+
+* Require role-based access controls.
+* Log all support access.
+* Avoid exposing sensitive notes, food logs, pain notes, or body metrics unless necessary and consented.
+
+---
+
+#### 16.13.12 Analytics decision
+
+Recommended MVP decision:
+
+* Use either no third-party analytics initially or a privacy-conscious product analytics setup with strict event hygiene.
+
+If analytics is included:
+
+* Track product events only.
+* Do not send raw food names.
+* Do not send body measurements.
+* Do not send pain notes.
+* Do not send private workout notes.
+* Use aggregate/categorical event properties where possible.
+
+Possible analytics events are already listed in Section 15.27.
+
+---
+
+### 16.14 Architecture decision summary table
+
+| Decision                       | Recommended default                                   |
+| ------------------------------ | ----------------------------------------------------- |
+| Platform                       | Mobile-first React Native / Expo app                  |
+| Language                       | TypeScript                                            |
+| Backend/database               | Supabase / Postgres or equivalent Postgres backend    |
+| Auth                           | Managed auth, email/password first                    |
+| Plan generation                | Server-side canonical rules engine                    |
+| Exercise DB size               | 75 to 125 high-quality exercises                      |
+| Nutrition Core                 | Lite nutrition first                                  |
+| Strict nutrition               | MVP Extended unless strategically required            |
+| First provider if strict ships | USDA FoodData Central first; Open Food Facts later    |
+| Offline support                | Preserve in-progress workout drafts locally           |
+| Sync                           | Basic sync first; full multi-device conflict UX later |
+| Plan revert                    | Clone prior version into new active version           |
+| Admin/support access           | Not in MVP Core                                       |
+| Analytics                      | Minimal, privacy-safe events only or none initially   |
+| AI                             | No autonomous changes in MVP Core                     |
+
+---
+
 ## 17. Acceptance Criteria Draft
 
 ### 14.1 Onboarding acceptance criteria
