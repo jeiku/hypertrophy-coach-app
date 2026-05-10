@@ -11,7 +11,7 @@
 - Regeneration always creates a new `plan_version`.
 - Completed history is immutable.
 
-Canonical exercise seed is checked in at `db/seeds/001_exercises_canonical_50.sql` with deterministic UUIDs/slugs and required `instruction_cues` + `safety_cues` fields.
+Canonical exercise seed is a required pre-implementation artifact checked in at `db/seeds/001_exercises_canonical_50.sql` with deterministic UUIDs/slugs and required `instruction_cues` + `safety_cues` fields. Plan generation is blocked until seed acceptance criteria in §10 pass.
 
 ---
 
@@ -277,6 +277,24 @@ Unique: `(user_id, lower(name)) where deleted_at is null`.
 - `version int not null default 1`
 - `deleted_at timestamptz null`
 
+## 2.17 `notification_preference`
+- `id uuid pk`
+- `user_id uuid not null unique references auth.users(id)`
+- `workout_reminders_enabled boolean not null default true`
+- `missed_workout_reminders_enabled boolean not null default true`
+- `weekly_review_reminders_enabled boolean not null default true`
+- `reminder_time_local time not null default '18:00:00'`
+- `weekly_review_weekday int not null default 7 check (weekly_review_weekday between 1 and 7)`
+- `weekly_review_time_local time not null default '10:00:00'`
+- `timezone text not null`
+- `timezone_behavior text not null check (timezone_behavior in ('follow_profile','fixed')) default 'follow_profile'`
+- `quiet_hours_start_local time null`
+- `quiet_hours_end_local time null`
+- `active boolean not null default true`
+- `version int not null default 1`
+- `deleted_at timestamptz null`
+Constraints: one active preference per user (`user_id` unique where `deleted_at is null`).
+
 
 ## 2.18 `exercise_catalog`
 - `id uuid pk` (deterministic seed IDs)
@@ -304,7 +322,7 @@ Constraints: unique `(slug)` and seed row count acceptance test `= 50 active can
 Constraints: unique `(user_id, exercise_id) where deleted_at is null`.
 Generator scoring impact (deterministic additive weight): `preferred +25`, `disliked -35`, `locked_in force-include when feasible`, `locked_out hard-exclude`.
 
-## 2.17 `user_limitation`
+## 2.20 `user_limitation`
 - `id uuid pk`
 - `user_id uuid not null references auth.users(id)`
 - `limitation_type limitation_type not null`
@@ -323,7 +341,7 @@ Generator scoring impact (deterministic additive weight): `preferred +25`, `disl
 ## 3) RLS policies (table-by-table)
 Assume helper function `auth.uid()` and service role bypass.
 
-- `user_profile`, `goal_plan`, `equipment_profile`, `equipment_profile_item`, `equipment_calendar_entry`, `body_weight_log`, `food_log`, `saved_meal`, `user_limitation`, `post_workout_check_in`: `USING (user_id = auth.uid())`, `WITH CHECK (user_id = auth.uid())`.
+- `user_profile`, `goal_plan`, `equipment_profile`, `equipment_profile_item`, `equipment_calendar_entry`, `body_weight_log`, `food_log`, `saved_meal`, `user_limitation`, `post_workout_check_in`, `notification_preference`: `USING (user_id = auth.uid())`, `WITH CHECK (user_id = auth.uid())`.
 - `plan_version`, `workout_day`, `exercise_instance`, `set_prescription`, `workout_session`, `set_log`, `recommendation`: client role **read-own only**; writes denied, backend service performs writes.
 
 Ownership-chain read policies:
@@ -467,6 +485,10 @@ Standard error payload:
 Response includes computed fields: `{weightKg,weeklyAvgKg,weeklyTrendKg}`.
 
 
+### 5.6b Notification preferences
+- `GET /v1/notification-preferences/me` response `{data:{notificationPreference,version}}`
+- `PUT /v1/notification-preferences/me` request `{ifMatchVersion,workoutRemindersEnabled,missedWorkoutRemindersEnabled,weeklyReviewRemindersEnabled,reminderTimeLocal,weeklyReviewWeekday,weeklyReviewTimeLocal,timezone,timezoneBehavior,quietHoursStartLocal?,quietHoursEndLocal?,active}` response `{data:{notificationPreference,version}}`
+
 ## 5.7 Regeneration behavior contract
 - **Same-day not_started session:** if scheduled date is local today and status `not_started`, regenerate may rebind to new active `plan_version` unless a local draft exists (see §5.8).
 - **Same-day in_progress session:** never rebound; remains attached to original plan_version until terminal.
@@ -500,14 +522,14 @@ Beginner reductions are deterministic: same slot order as intermediate; apply `s
 - Day 2 Full Body B: `hip_thrust_pattern(3,6-10,p1)`, `vertical_push(2,8-12,p2)`, `vertical_pull(3,6-10,p1)`, `lunge_pattern(2,8-12,p2)`, `core_anti_rotation(2,10-15,p3)`, `calf_plantarflexion(2,10-15,p4,opt)`
 
 ### 6.3 3-day intermediate template
-- Day 1 Upper A: `horizontal_push(4,6-10,p1)`, `horizontal_pull(4,6-10,p1)`, `vertical_push(3,8-12,p2)`, `vertical_pull(3,8-12,p2)`, `elbow_extension_isolation(3,8-15,p3,opt)`
-- Day 2 Lower: `squat_pattern(4,5-8,p1)`, `hinge_pattern(3,6-10,p1)`, `lunge_pattern(3,8-12,p2)`, `knee_flexion_isolation(3,10-15,p3)`, `core_anti_extension(3,10-15,p3)`
-- Day 3 Upper B: `vertical_pull(4,6-10,p1)`, `horizontal_push(3,8-12,p2)`, `horizontal_pull(3,8-12,p2)`, `lateral_raise_pattern(3,12-20,p4,opt)`, `elbow_flexion_isolation(3,8-15,p3)`
+- Day 1 Full Body A: `squat_pattern(4,5-8,p1)`, `horizontal_push(4,6-10,p1)`, `horizontal_pull(4,6-10,p1)`, `hinge_pattern(3,6-10,p2)`, `core_anti_extension(3,10-15,p3)`, `lateral_raise_pattern(3,12-20,p4,opt)`
+- Day 2 Full Body B: `hip_thrust_pattern(4,6-10,p1)`, `vertical_push(3,8-12,p2)`, `vertical_pull(4,6-10,p1)`, `lunge_pattern(3,8-12,p2)`, `core_anti_rotation(3,10-15,p3)`, `calf_plantarflexion(3,10-15,p4,opt)`
+- Day 3 Full Body C: `hinge_pattern(4,5-8,p1)`, `horizontal_push(3,8-12,p2)`, `vertical_pull(3,8-12,p2)`, `knee_flexion_isolation(3,10-15,p3)`, `elbow_flexion_isolation(3,8-15,p3,opt)`, `rear_delt_raise_pattern(3,12-20,p4,opt)`
 
 ### 6.4 3-day beginner template
-- Day 1 Upper A: `horizontal_push(3,6-10,p1)`, `horizontal_pull(3,6-10,p1)`, `vertical_push(2,8-12,p2)`, `vertical_pull(2,8-12,p2)`, `elbow_extension_isolation(2,8-15,p3,opt)`
-- Day 2 Lower: `squat_pattern(3,5-8,p1)`, `hinge_pattern(2,6-10,p1)`, `lunge_pattern(2,8-12,p2)`, `knee_flexion_isolation(2,10-15,p3)`, `core_anti_extension(2,10-15,p3)`
-- Day 3 Upper B: `vertical_pull(3,6-10,p1)`, `horizontal_push(2,8-12,p2)`, `horizontal_pull(2,8-12,p2)`, `lateral_raise_pattern(2,12-20,p4,opt)`, `elbow_flexion_isolation(2,8-15,p3)`
+- Day 1 Full Body A: `squat_pattern(3,5-8,p1)`, `horizontal_push(3,6-10,p1)`, `horizontal_pull(3,6-10,p1)`, `hinge_pattern(2,6-10,p2)`, `core_anti_extension(2,10-15,p3)`, `lateral_raise_pattern(2,12-20,p4,opt)`
+- Day 2 Full Body B: `hip_thrust_pattern(3,6-10,p1)`, `vertical_push(2,8-12,p2)`, `vertical_pull(3,6-10,p1)`, `lunge_pattern(2,8-12,p2)`, `core_anti_rotation(2,10-15,p3)`, `calf_plantarflexion(2,10-15,p4,opt)`
+- Day 3 Full Body C: `hinge_pattern(3,5-8,p1)`, `horizontal_push(2,8-12,p2)`, `vertical_pull(2,8-12,p2)`, `knee_flexion_isolation(2,10-15,p3)`, `elbow_flexion_isolation(2,8-15,p3,opt)`, `rear_delt_raise_pattern(2,12-20,p4,opt)`
 
 ### 6.5 4-day intermediate template
 - Day 1 Upper Push/Pull A: `horizontal_push(4,6-10,p1)`, `horizontal_pull(4,6-10,p1)`, `vertical_push(3,8-12,p2)`, `lateral_raise_pattern(3,12-20,p4,opt)`, `elbow_extension_isolation(3,8-15,p3)`
@@ -598,6 +620,13 @@ Auditability requirements:
 13. Equipment item full-replace persists and removes omitted items.
 14. Body weight uniqueness on `(user_id, logged_on)` enforced.
 15. Weekly trend matches 7-day window formula.
+16. `notification_preference` RLS blocks cross-user reads/writes; owner can read/update own row only.
+17. `GET/PUT /v1/notification-preferences/me` round-trips all fields with optimistic concurrency (`ifMatchVersion`).
+18. Seed artifact gate: `db/seeds/001_exercises_canonical_50.sql` exists and is migration-loadable before plan-generation integration tests run.
+19. Seed content gate: exactly 50 `exercise_catalog` rows are active canonical exercises with deterministic UUID and unique slug per row.
+20. Seed completeness gate: every seeded exercise has non-null movement intent, equipment key, primary muscles, instruction cues, and safety cues.
+21. Template coverage gate: movement intents required by 2-day through 6-day templates each have at least one active eligible canonical exercise.
+22. Generator infeasibility gate: if any required movement intent has zero eligible exercises after filtering, generation fails with HTTP `422` and explicit `infeasibleErrors` reason code `NO_ELIGIBLE_EXERCISE_FOR_MOVEMENT_INTENT`.
 ## 5.8 Local workout draft sync contract
 Local draft object (per session):
 ```json
