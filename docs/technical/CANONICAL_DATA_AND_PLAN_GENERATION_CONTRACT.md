@@ -387,6 +387,7 @@ Columns:
 - `started_at timestamptz null`
 - `ended_at timestamptz null`
 - `notes text null`
+- `deleted_at timestamptz null`
 - `created_at timestamptz not null default now()`
 - `updated_at timestamptz not null default now()`
 - `version_token integer not null default 1`
@@ -414,6 +415,7 @@ Columns:
 - `duration_seconds integer null check (duration_seconds between 0 and 7200)`
 - `notes text null`
 - `client_mutation_id text not null`
+- `deleted_at timestamptz null`
 - `created_at timestamptz not null default now()`
 - `updated_at timestamptz not null default now()`
 
@@ -424,6 +426,7 @@ Constraints/indexes:
 - if `set_source='prescribed'` then `set_prescription_id is not null`; if `set_source='added'` then `set_prescription_id is null`.
 - prescribed set logs must reference a `set_prescription` whose `exercise_instance_id` equals set log `exercise_instance_id` and belongs to same `workout_session.plan_version_id` chain.
 - added set logs are allowed for user edits but cannot be marked prescribed by trigger rewrite/validation.
+- soft-deleted (`deleted_at` non-null or state/status `deleted`) workout sessions and set logs are excluded from recommendation/progression inputs and are eligible for hard-delete after retention window; completed history immutability guarantee remains unchanged.
 
 ### 2.16 `post_workout_check_in`
 **Purpose:** Post-session recovery/safety check aligned with PRD.
@@ -749,6 +752,12 @@ Suggest hold when any are true (and reduce / safety did not fire):
 - logging incomplete.
 - RIR missing and readiness unclear.
 
+Additional PRD safety/recovery recommendation rules (additive; do not replace existing pain suppression, deload, or precedence rules):
+- high soreness for a muscle group MUST cause the next session for that same muscle group to suggest hold (`hold_load`) unless a higher-precedence safety/reduce outcome fires.
+- same-location pain across 2+ sessions MUST surface notice text exactly `Consider professional guidance` and MUST NOT diagnose.
+- 3+ missed workouts in trailing 14 days MUST surface `Consider fewer training days?`.
+- repeated partial workouts due to time constraints (>=2 in trailing 14 days) MUST surface `Consider shorter sessions?`.
+
 ### 2.B.4 Reduce threshold
 Suggest reduce when any are true (and safety did not fire):
 - reps below minimum target on 2+ working sets.
@@ -772,9 +781,9 @@ Every recommendation object MUST include:
 - `recommendationType`
 - `triggerFactors`
 - `userFacingReason`
-- `educationalContext`
-UI contract: always expose `userFacingReason` first; `educationalContext` is shown on deeper tap.
-Additional machine-readable fields are additive only and MUST NOT replace these four required fields.
+- `educationalContext` (optional/nullable)
+UI contract: always expose `userFacingReason` first; `educationalContext` is shown on deeper tap only when present.
+Additional machine-readable fields are additive only and MUST NOT replace required `userFacingReason`.
 
 ## 3) API contract (full endpoints)
 
@@ -1033,6 +1042,16 @@ Conflict handling codes:
   - Errors: `404 EQUIPMENT_PROFILE_NOT_FOUND`, `409 VERSION_CONFLICT|DUPLICATE_EQUIPMENT_ITEM`, `422 INVALID_EQUIPMENT_KEY|FK_OWNERSHIP_VIOLATION`.
   - Transaction/RLS: insert item + parent token bump atomic; parent `user_id` ownership validated.
 
+#### 3.16.3A Equipment-change revalidation contract (MVP)
+- `POST /v1/equipment-profiles/{id}/revalidate-plan`
+  - Request: `{ equipmentProfileVersionToken:number, activePlanVersionId:uuid, choice:'substitute_incompatible'|'regenerate_affected_days'|'regenerate_rest_of_week'|'keep_plan_warn', versionToken:number }`.
+  - Scope: applies only to future `not_started` workouts/sessions; `in_progress` sessions are unchanged and retain original `planVersionId`.
+  - Supported choices are contract-limited to: substitute incompatible exercises, regenerate affected day(s), regenerate rest of week, or keep plan and warn.
+  - Success `200`: `{ data:{ affectedSessionIds:uuid[], untouchedInProgressSessionIds:uuid[], warnings:string[], resultingPlanVersionId?:uuid } }`.
+  - Validation/warning behavior: `keep_plan_warn` returns incompatibility warnings and MUST NOT mutate planned structure rows.
+  - Transaction notes: ownership, version checks, and incompatibility detection are evaluated in one snapshot; mutation choices execute atomically; idempotency replay returns same result.
+  - Errors: `404 PLAN_VERSION_NOT_FOUND`, `409 VERSION_CONFLICT`, `422 INVALID_REVALIDATION_CHOICE|INVALID_STATE_TRANSITION|FK_OWNERSHIP_VIOLATION`.
+
 #### 3.16.4 Exercise catalog read APIs
 - `GET /v1/exercises?movementIntent=&equipmentKey=&limit=&cursor=` and `GET /v1/exercises/{id}`.
 - Read-only through API proxy to seed tables; direct client table access is allowed only read (`is_active=true`) under RLS.
@@ -1088,6 +1107,7 @@ Conflict handling codes:
 ## 4) Regeneration and state-safety matrix
 
 When regenerating plan or changing equipment profile:
+- equipment profile changes apply only to future `not_started` workouts/sessions (per-day equipment logic remains post-MVP).
 - `not_started`: if scheduled today, keep existing session unless user explicitly chooses replace; future not_started sessions may remap to new plan version.
 - `in_progress`: remains attached to original `plan_version_id`; never migrated.
 - `completed`: immutable history; never overwritten.
@@ -1139,8 +1159,8 @@ Hard guarantees:
 | Source | Target | Trigger | versionToken | Idempotency | Invalid transition |
 |---|---|---|---|---|---|
 | not_synced | partially_synced | `POST /v1/sync/local-drafts/recover` with partial apply | session token required if session exists | required | `409 PARTIAL_SYNC_CONFLICT` |
-| not_synced/partially_synced | synced | `POST /v1/sync/local-drafts/recover` full apply | required when session exists | required | `409 STALE_VERSION_TOKEN` |
-| not_synced/partially_synced | conflicted | server conflict detection during recover | required when session exists | required | `409 PLAN_VERSION_MISMATCH|WORKOUT_DAY_MISMATCH|LOCAL_DRAFT_SCHEDULED_DATE_CONFLICT` |
+| not_synced or partially_synced | synced | `POST /v1/sync/local-drafts/recover` full apply | required when session exists | required | `409 STALE_VERSION_TOKEN` |
+| not_synced or partially_synced | conflicted | server conflict detection during recover | required when session exists | required | `409 PLAN_VERSION_MISMATCH` or `409 WORKOUT_DAY_MISMATCH` or `409 LOCAL_DRAFT_SCHEDULED_DATE_CONFLICT` |
 | conflicted | synced | client retries recover with corrected payload | required | required | `409 PARTIAL_SYNC_CONFLICT` |
 
 ---
@@ -1296,6 +1316,12 @@ Must-pass tests:
 26. Onboarding-abandoned local sample plan discard-after-expiry: after >7 days, local sample plan is discarded and restore prompt is not shown.
 27. Profile RIR toggle persistence: `show_rir_field` defaults false, PATCH/PUT profile updates return `showRirField`, and concurrent writes enforce `409 VERSION_CONFLICT`.
 28. Pain suppression mapping precision: shoulder suppresses back compounds via tags (not blanket horizontal/vertical pull movement suppression); lower_back and ankle suppression include `loaded_standing`; `other` suppresses nothing.
+29. High soreness for a muscle group forces next same-muscle session recommendation to hold unless higher-precedence safety/reduce rule fires.
+30. Same-location pain across 2+ sessions surfaces exactly `Consider professional guidance` and emits no diagnostic language.
+31. 3+ missed workouts in trailing 14 days surfaces exactly `Consider fewer training days?`.
+32. Repeated partial workouts due to time constraints (>=2 in trailing 14 days) surfaces exactly `Consider shorter sessions?`.
+33. Equipment-change revalidation applies only to future `not_started` workouts/sessions, leaves `in_progress` sessions on original `plan_version_id`, and supports only four contract choices.
+34. Soft-deleted workout sessions/set logs are excluded from recommendation inputs and become hard-delete eligible after retention window without rewriting completed history.
 ### 6.1 Concrete Given/When/Then acceptance tests
  Concrete Given/When/Then acceptance tests
 - Given two same-day slots and identical top candidate, when generator assigns slot2, then cross-slot exclusion picks next candidate.
@@ -1381,6 +1407,7 @@ Blocking decisions outside this contract (if unresolved in PRD) must remain flag
 - legal/privacy deletion policy and retention text (blocking production data lifecycle implementation).
 - final safety disclaimer copy.
 - Apple/Google sign-in decision.
+- Apple/Google sign-in conflict remains an explicit PRD open-decision blocker; MVP auth remains email/password unless that PRD decision is formally closed.
 - final exercise seed list contents (contract keeps ~80 guidance until finalized list is approved).
 - pricing validation.
 - WCAG audit cadence and accessibility QA owner assignment.
@@ -1412,8 +1439,8 @@ Blocking decisions outside this contract (if unresolved in PRD) must remain flag
 
 
 ## 11) Patch Summary
-- Sections patched: §2.6 (`exercise_catalog` eligibility fields/checks), §2.A.5 (experience-level hard-disqualifier/fallback behavior), §4.1.4 (sync/local draft transitions table format validation), §5 (RLS wording consistency), §5.1 (named RPC signatures/contracts list), §5.2 (expanded mutable endpoint + RPC error-code matrix), §6 (trust-survey persistence consistency text), §10.B (readiness checklist accuracy), and this §11 summary.
+- Sections patched (surgical only): §2.14/§2.15 (soft-delete retention implementability via `deleted_at` and exclusion rules), §2.B (PRD safety/recovery additions + `educationalContext` optional/nullable wording alignment), §3.16.3A (equipment-change revalidation contract), §4 and §4.1.4 (equipment-change state-safety clarifications + valid sync/local draft table formatting), §6 (acceptance tests for new behaviors), §9 (Apple/Google sign-in open-decision blocker note), §10.B wording alignment, and this §11 summary.
 - Sections deleted: none.
 - Remaining blockers before production implementation: PRD §0 pre-build gates must pass/sign-off; all §9 open PRD/contract decisions must be closed; migration DDL and RPC implementations must be generated from this contract; and CI integration/e2e must pass §6 acceptance tests.
-- Architecture-freeze remains blocked only by unresolved external/open-decision evidence and implementation artifacts (not by missing contract matrix/RLS/RPC text after this patch).
+- Architecture-freeze readiness remains unmarked while open decisions or implementation artifacts remain incomplete.
 - Confirmation: this patch preserved existing schema/API/RLS/sync/state-machine/acceptance-test detail and only added/amended targeted consistency and implementation-safety content.
