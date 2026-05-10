@@ -42,6 +42,7 @@ Out of scope for MVP: nutrition entities/APIs, per-day equipment calendar logic,
 - `limitation_type`: `mobility_limit | pain_history | injury_history | medical_restriction | equipment_constraint | other`
 - `limitation_severity`: `low | moderate | high | hard_block`
 - `limitation_status`: `active | resolved | archived`
+- `movement_intent`: `knee_dominant_squat | hip_hinge | horizontal_push | vertical_push | horizontal_pull | vertical_pull | single_leg | core_anti_extension | core_anti_rotation | arm_elbow_flexion | arm_elbow_extension | lateral_deltoid | rear_deltoid | calf_plantarflexion`
 
 ---
 
@@ -168,7 +169,7 @@ Columns:
 - `id uuid pk`
 - `exercise_key text not null unique`
 - `name text not null`
-- `movement_intents text[] not null`
+- `movement_intents movement_intent[] not null`
 - `suppression_tags text[] not null default '{}'`
 - `primary_muscles text[] not null`
 - `secondary_muscles text[] not null default '{}'`
@@ -193,7 +194,7 @@ Columns:
 
 Constraints/indexes:
 - GIN indexes on `movement_intents`, `suppression_tags`, `primary_muscles`, `equipment_keys`.
-- `suppression_tags` values must come from canonical domain: `chest`,`shoulders`,`back_compound_pull`,`triceps_overhead_loaded`,`biceps`,`triceps`,`loaded_grip_pull`,`loaded_pressing`,`loaded_pulling`,`posterior_chain_loaded`,`spinal_loading`,`rows`,`pull_ups`,`loaded_carries`,`squat_pattern`,`hinge_pattern`,`lunge_pattern`,`leg_extension`,`leg_press`,`calf`,`loaded_standing`,`loaded_carry`.
+- `suppression_tags` values must come from canonical domain: `chest`,`shoulders`,`back_compound_pull`,`triceps_overhead_loaded`,`biceps`,`triceps`,`loaded_grip_pull`,`loaded_pressing`,`loaded_pulling`,`posterior_chain_loaded`,`spinal_loading`,`rows`,`pull_ups`,`loaded_carries`,`squat_pattern`,`hinge_pattern`,`lunge_pattern`,`leg_extension`,`leg_press`,`calf`,`loaded_standing`,`horizontal_pull`.
 - checks: `cardinality(movement_intents)>=1`, `cardinality(primary_muscles)>=1`, `cardinality(equipment_keys)>=1`.
 - all cue/timing columns required (non-null) for seeded active exercises.
 
@@ -273,10 +274,15 @@ Columns:
 - `trust_rating integer not null check (trust_rating between 1 and 5)`
 - `submitted_at timestamptz not null`
 - `created_at timestamptz not null default now()`
+- `updated_at timestamptz not null default now()`
+- `version_token integer not null default 1 check (version_token >= 1)`
 
 Constraints/indexes:
 - `unique (user_id, week_index)` (no duplicate response for same user/week in MVP; update semantics are explicit overwrite through endpoint upsert path only).
 - index `(user_id, submitted_at desc)`.
+
+Versioning/concurrency:
+- endpoint/RPC writes require current `version_token`; successful upsert increments token exactly `+1` whether insert-or-update path.
 
 ### 2.10 `plan_version`
 **Purpose:** Immutable generated plan snapshot metadata + lifecycle.
@@ -550,16 +556,34 @@ Contract rule: every internal `movementIntent` value MUST map to exactly one PRD
 
 ### 2.A.2 Split templates by days/week (PRD-exact)
 - 2 days/week: Full Body A/B.
+  - Day A slots: `knee_dominant_squat`,`horizontal_push`,`horizontal_pull`,`hip_hinge`,`vertical_push`,`core_anti_extension`,`arm_elbow_flexion`.
+  - Day B slots: `single_leg`,`vertical_pull`,`horizontal_push`,`hip_hinge`,`lateral_deltoid`,`arm_elbow_extension`,`calf_plantarflexion`.
 - 3 days/week: Full Body A/B/C.
+  - Day A: `knee_dominant_squat`,`horizontal_push`,`horizontal_pull`,`hip_hinge`,`core_anti_extension`,`arm_elbow_flexion`.
+  - Day B: `single_leg`,`vertical_push`,`vertical_pull`,`hip_hinge`,`rear_deltoid`,`arm_elbow_extension`,`calf_plantarflexion`.
+  - Day C: `knee_dominant_squat`,`horizontal_pull`,`horizontal_push`,`single_leg`,`core_anti_rotation`,`lateral_deltoid`.
 - 4 days/week: Upper/Lower.
+  - Upper A: `horizontal_push`,`horizontal_pull`,`vertical_push`,`vertical_pull`,`lateral_deltoid`,`arm_elbow_flexion`,`arm_elbow_extension`.
+  - Lower A: `knee_dominant_squat`,`hip_hinge`,`single_leg`,`calf_plantarflexion`,`core_anti_extension`.
+  - Upper B: `vertical_push`,`vertical_pull`,`horizontal_push`,`horizontal_pull`,`rear_deltoid`,`arm_elbow_flexion`,`arm_elbow_extension`.
+  - Lower B: `hip_hinge`,`knee_dominant_squat`,`single_leg`,`calf_plantarflexion`,`core_anti_rotation`.
 - 5 days/week: Upper/Lower + 1 focus day.
+  - Upper A, Lower A, Upper B, Lower B as above.
+  - Focus day: exactly 6 slots and at least 3 slots must target `focus_muscles`-aligned intents from (`horizontal_push`,`vertical_push`,`horizontal_pull`,`vertical_pull`,`arm_elbow_flexion`,`arm_elbow_extension`,`lateral_deltoid`,`rear_deltoid`,`calf_plantarflexion`,`core_anti_extension`,`core_anti_rotation`).
 - 6 days/week, beginner: Full Body x6 with conservative volume.
+  - A/B/C repeated twice; max 6 slots per day; no day may include both `knee_dominant_squat` and `hip_hinge` with fatigue_cost >=4.
 - 6 days/week, intermediate: PPL x2.
+  - Push day: `horizontal_push`,`vertical_push`,`arm_elbow_extension`,`lateral_deltoid`,`core_anti_extension`.
+  - Pull day: `horizontal_pull`,`vertical_pull`,`arm_elbow_flexion`,`rear_deltoid`,`core_anti_rotation`.
+  - Legs day: `knee_dominant_squat`,`hip_hinge`,`single_leg`,`calf_plantarflexion`.
 Deterministic template resolution keys: `(daysPerWeek, experienceLevel)`.
 MVP `goalType` is recorded-only metadata and MUST NOT affect template choice, slot counts, volume targets, exercise selection, progression, or recommendation decisions.
 
 ### 2.A.3 Initial weekly volume targets (PRD muscle-by-muscle tables)
 Generator SHALL use the PRD v0.6 explicit beginner/intermediate muscle-by-muscle weekly set ranges (no major/minor substitution).
+Canonical constants (sets/week):
+- beginner: chest 8-12, back 10-14, quads 8-12, hamstrings 6-10, glutes 6-10, shoulders 6-10, biceps 4-8, triceps 4-8, calves 4-8, core 4-8.
+- intermediate: chest 10-16, back 12-18, quads 10-16, hamstrings 8-14, glutes 8-14, shoulders 8-14, biceps 6-10, triceps 6-10, calves 6-10, core 6-10.
 - no history -> initialize at low end of PRD range.
 - generator target -> midpoint of PRD range.
 - progression volume increases are gated: minimum 14 consecutive days of adherence consistency and no high-soreness paired signal and no pain flag.
@@ -570,15 +594,17 @@ Core duration estimate per session uses exercise-specific values:
 `sum_over_exercises(sum_over_sets(target_reps * tempo_seconds + rest_seconds) + warmup_overhead + setup_overhead)`.
 No fixed global `avgRepSeconds` constant is permitted as the core estimation rule.
 Threshold: run cut policy when estimated duration `> target_session_minutes * 1.15`.
-Accessory-cut priority is PRD-ordered and MUST preserve PRD focus-muscle protection and PRD set-count reduction floors before any slot drop.
+Accessory-cut priority order: `core_anti_extension/core_anti_rotation` -> `arm_elbow_flexion` -> `arm_elbow_extension` -> `lateral_deltoid/rear_deltoid` -> `calf_plantarflexion` -> compound non-focus slot last. Set-count floors before slot drop: compounds >=2 sets, accessories >=1 set, focus-muscle slots >=2 sets. Focus-muscle protection: if a slot maps to a focus muscle, it cannot be cut until all non-focus accessory slots have reached floor.
 
 ### 2.A.5 Hard disqualifiers
 Candidate exercise is ineligible if any true:
 - inactive in `exercise_catalog`.
 - required equipment not in active equipment profile.
 - user limitation with severity `hard_block` intersects movement intent, muscle, or equipment.
-- exercise marked disliked with active pain flag for matching location in last 14 days.
-- experience level below `experience_level_min`.
+- active pain-location suppression mapping (§2.B.1.A) or active hard-block limitation contraindicates movement intent/muscle/equipment.
+
+`disliked` is NOT a hard disqualifier; it remains a scoring penalty in §2.A.6 and may be relaxed only via §2.A.7 fallback.
+Experience-level filter (`experience_level_min`) applies only when at least one alternative eligible candidate exists for the slot; if no alternative exists, this filter must be relaxable in unfillable-slot fallback before slot-drop.
 
 ### 2.A.6 Selection rule precedence, scoring weights, tie-breakers (PRD-exact)
 Scoring components:
@@ -592,13 +618,13 @@ Scoring components:
 - High fatigue cost on back-to-back day `-10`
 - Recently skipped 3+ times `-20`
 - User disliked `-30`
-Tie-breakers: MUST follow PRD exact order (no substitutions).
+Tie-breakers: MUST follow explicit precedence order: safety/pain -> equipment -> locked user choice -> schedule/session length -> movement coverage -> experience-level volume cap -> disliked -> focus muscles -> preferred -> variety.
 
 ### 2.A.7 Cross-slot exclusion, variety enforcement, unfillable-slot fallback (PRD-exact)
 Cross-slot exclusion in same day:
 - cannot assign same `exercise_catalog_id` to >1 slot.
 - cannot assign two hinge-intent heavy spinal-loading lifts if both fatigue_cost >=4.
-Variety enforcement remains as previously specified.
+Variety rule: across A/B sessions in the same week, at least one exercise per movement intent must differ. If A/B days are identical for any movement intent, rerun selection for that intent using the second-highest-ranked exercise for the most-overused intent.
 Unfillable fallback order when max score `< 0` after filters/exclusions:
 1) ignore disliked penalty.
 2) ignore preferred boost.
@@ -651,14 +677,14 @@ Movement coverage summary output:
 
 | painLocation | suppressedMuscles | suppressedMovements | substitutionRequiredForEligibleExercises | progressionSuppressed |
 |---|---|---|---|---|
-| shoulder | [chest,shoulders,back_compound_pull,triceps_overhead_loaded] | [horizontal_push,vertical_push,horizontal_pull,vertical_pull_overhead_loaded] | true | true |
+| shoulder | [chest,shoulders,back_compound_pull,triceps_overhead_loaded] | [horizontal_push,vertical_push,horizontal_pull,vertical_pull] | true | true |
 | elbow | [biceps,triceps,loaded_grip_pull] | [horizontal_pull,vertical_pull,arm_elbow_flexion,arm_elbow_extension] | true | true |
 | wrist | [loaded_pressing,loaded_pulling] | [horizontal_push,vertical_push,horizontal_pull,vertical_pull] | true | true |
-| lower_back | [posterior_chain_loaded,spinal_loading] | [hip_hinge,knee_dominant_squat,loaded_standing] | true | true |
-| upper_back | [rows,pull_ups,loaded_carries] | [horizontal_pull,vertical_pull,loaded_carry] | true | true |
+| lower_back | [posterior_chain_loaded,spinal_loading] | [hip_hinge,knee_dominant_squat] | true | true |
+| upper_back | [rows,pull_ups,loaded_carries] | [horizontal_pull,vertical_pull,horizontal_pull] | true | true |
 | hip | [squat_pattern,hinge_pattern,lunge_pattern] | [knee_dominant_squat,hip_hinge,single_leg] | true | true |
 | knee | [squat_pattern,lunge_pattern,leg_extension,leg_press] | [knee_dominant_squat,single_leg] | true | true |
-| ankle | [squat_pattern,lunge_pattern,calf,loaded_standing] | [knee_dominant_squat,single_leg,calf_plantarflexion,loaded_standing] | true | true |
+| ankle | [squat_pattern,lunge_pattern,calf] | [knee_dominant_squat,single_leg,calf_plantarflexion] | true | true |
 | other | [] | [] | false | false |
 
 Application rules: mapping is applied to exercise eligibility filtering, substitution candidate retrieval, and progression recommendation suppression; `other` does not auto-suppress but emits review prompt.
@@ -840,7 +866,7 @@ The endpoint schema expansions in §3.12–§3.14 are normative subsections of �
 - Headers: `Idempotency-Key` required
 - Body: `{ "versionToken":7, "weekIndex":4, "trustRating":5, "submittedAt":"2026-05-10T12:00:00Z" }`
 - Success `200`: `{ "data": { "weekIndex":4, "trustRating":5, "submittedAt":"...", "versionToken":8 } }`
-- Behavior: upsert for `(user_id, week_index)`; repeated same payload + idempotency key replays success.
+- Behavior: upsert for `(user_id, week_index)` via `rpc_upsert_trust_survey_response`; request `versionToken` must match current `trust_survey_response.version_token` for update path (or current `user_profile.versionToken` on first insert when no row exists). Success increments `trust_survey_response.version_token` by exactly +1 and returns that token.
 
 ### 3.13 Account deletion request
 26) `POST /v1/account/deletion-request`
@@ -854,12 +880,12 @@ The endpoint schema expansions in §3.12–§3.14 are normative subsections of �
  (authoritative supplement to §3.1–§3.11)
 For each endpoint in §3, the following are mandatory and not optional: method/path, auth, required headers, strict request schema, strict success schema, error codes, idempotency behavior, versionToken behavior, transaction notes, RLS ownership checks.
 
-#### 3.12.1 Shared request/response envelopes
+#### 3.14.1 Shared request/response envelopes
 - Request headers for authenticated mutable endpoints: `Authorization`, `Content-Type: application/json`, `Idempotency-Key`.
 - Success envelope: `{ "data": <resource>, "meta": { "requestId": "uuid", "idempotencyReplay": false } }`.
 - Error envelope: `{ "error": { "code": "...", "message": "...", "details": {...} } }`.
 
-#### 3.12.2 Full schema obligations by endpoint group
+#### 3.14.2 Full schema obligations by endpoint group
 - Plans endpoints (§3.1): body must include all required IDs, optional fields explicitly nullable; response must include planVersion with workoutDays[] -> exercises[] -> setPrescriptions[] and `planExplanation`, `validationWarnings`, `movementCoverageSummary`.
 - Workout session endpoints (§3.2): response includes `status`, `versionToken`, `startedAt`, `endedAt`, `scheduledForDate`.
 - Set logs endpoint (§3.3): entries require `clientMutationId`, `exerciseInstanceId`, `setSource`, `setLogIndex`, reps/load/RIR fields; `setPrescriptionId` required only for prescribed sets.
@@ -872,7 +898,7 @@ For each endpoint in §3, the following are mandatory and not optional: method/p
 - Public sample plan (§3.10): no auth, no user-owned writes, rate limits.
 - Local draft recovery (§3.11): strict local draft schema in §3.15.
 
-#### 3.12.3 Endpoint-level idempotency and versionToken behavior
+#### 3.14.3 Endpoint-level idempotency and versionToken behavior
 - `POST /v1/plans/generate`: idempotent by key+body; no versionToken required.
 - `POST /v1/plans/{id}/accept|regenerate|revert`: require versionToken; stale -> `409 VERSION_CONFLICT`.
 - `POST /v1/workout-sessions/start`: idempotent create by key+day+date.
@@ -919,7 +945,7 @@ Conflict handling codes:
 ### 3.16 Missing MVP endpoint contracts
  (authoritative supplement to §3)
 
-#### 3.14.1 User profile / onboarding
+#### 3.16.1 User profile / onboarding
 - `PUT /v1/user-profile`
   - Request: `{ versionToken?: number, birthDate?: date|null, sex?: enum|null, heightCm?: number|null, bodyWeight?: number|null, bodyWeightUnit?: kg|lb|null, experienceLevel?: beginner|intermediate|null, timezone: string, onboardingCompletedAt?: timestamptz|null, analyticsOptOut?: boolean }`
   - Success: `{ data: { ...userProfile, versionToken:number } }`
@@ -929,23 +955,23 @@ Conflict handling codes:
   - Idempotency/versioning: requires `Idempotency-Key`; create path may omit versionToken, update path requires exact current token.
   - RLS: only `user_profile.user_id=auth.uid()` row.
 
-#### 3.14.2 Goal plan CRUD
+#### 3.16.2 Goal plan CRUD
 - `POST /v1/goal-plans`, `PATCH /v1/goal-plans/{id}` with strict fields from §2.2.
 - Active-goal uniqueness enforced transactionally; update/archive prior active in same transaction.
 
-#### 3.14.3 Equipment profile and items
+#### 3.16.3 Equipment profile and items
 - `POST /v1/equipment-profiles`, `PATCH /v1/equipment-profiles/{id}`, `DELETE /v1/equipment-profiles/{id}` (soft-delete/archive only if referenced).
 - `POST /v1/equipment-profiles/{id}/items` request `{ equipmentProfileVersionToken:number, equipmentKey:string }`.
 - Delete item endpoint in §3.9 remains authoritative; add endpoint follows same parent token bump semantics.
 
-#### 3.14.4 Exercise catalog read APIs
+#### 3.16.4 Exercise catalog read APIs
 - `GET /v1/exercises?movementIntent=&equipmentKey=&limit=&cursor=` and `GET /v1/exercises/{id}`.
 - Read-only through API proxy to seed tables; direct client table access is allowed only read (`is_active=true`) under RLS.
 
-#### 3.14.5 Exercise preference CRUD
+#### 3.16.5 Exercise preference CRUD
 - `POST /v1/exercise-preferences`, `PATCH /v1/exercise-preferences/{id}`, `DELETE /v1/exercise-preferences/{id}` using §2.7 schema and versionToken for patch/delete.
 
-#### 3.14.6 Substitution candidates + apply
+#### 3.16.6 Substitution candidates + apply
 - `POST /v1/substitutions/candidates`
   - Request: `{ planVersionId:uuid, workoutDayId:uuid, exerciseInstanceId:uuid, context:'future_plan'|'session_override', painLocation?:pain_location[], unavailableEquipmentKeys?:string[], versionToken:number }`
   - Success: `{ data:{ candidates:[{ exerciseCatalogId:uuid, score:number, whyThisSubstitution:{ movementIntentMatch:boolean, equipmentCompatible:boolean, painSuppressionApplied:boolean, fatigueComparison:string, historyLoadHint?:string|null } }], suppressedByPainMapping:boolean } }`
@@ -954,10 +980,10 @@ Conflict handling codes:
   - Success: `{ data:{ substitutionId:uuid, mutationType:'replace_future_exercise_instance'|'session_level_override', newExerciseInstanceId?:uuid, preservedOriginalExerciseInstanceId:uuid } }`
   - Mutation rule: future-plan applies by creating replacement `exercise_instance` row and retiring original from future view; session override writes through `exercise_substitution.session_override_payload` only (no separate `session_exercise_override` entity in MVP). Completed workout history and completed set logs are never rewritten.
 
-#### 3.14.7 Recommendation action ignoredReason other text
+#### 3.16.7 Recommendation action ignoredReason other text
 - `POST /v1/recommendations/{id}/ignore` request extends to `{ versionToken:number, ignoredReason:enum, ignoredReasonText?:string|null }`; `ignoredReasonText` required when `ignoredReason='other'`.
 
-#### 3.14.8 Transaction/RPC notes for endpoint groups
+#### 3.16.8 Transaction/RPC notes for endpoint groups
 - Workout-session status transitions are RPC-only (`rpc_transition_workout_session`).
 - Recommendation accept/ignore/dismiss are RPC-only (`rpc_apply_recommendation_action`).
 - Set logs are append/idempotent insert only via RPC (`rpc_append_set_logs`); no client update/delete contract.
@@ -1020,7 +1046,7 @@ Trigger responsibilities:
 - increment `version_token` exactly +1 on mutable updates.
 - enforce parent-child ownership invariants.
 - bump `equipment_profile.version_token` on item create/update/delete.
-### 5.1 RLS/FK/trigger/RPC enforcement expansion (integrated from former §5.A)
+### 5.1 RLS/FK/trigger/RPC enforcement expansion
  RLS/FK/trigger/RPC enforcement expansion (per-table matrix required)
 Per-table RLS matrix (explicit):
 - `user_profile`: client select ✅ insert ✅ update ✅ delete ❌; RPC-only writes ❌; service-role-only writes ❌; policy `USING (user_id=auth.uid()) WITH CHECK (user_id=auth.uid())`.
@@ -1078,7 +1104,7 @@ FK chain validation examples:
 Must-pass tests:
 1. Full schema DDL tests for all tables in §2.
 2. `version_token` stale write (`409`) and +1 increment on success across all mutable tables.
-3. Endpoint contract tests with request/response/error examples for all 24 endpoints.
+3. Endpoint contract tests with request/response/error examples for all MVP endpoints defined in §3.
 4. Regeneration safety matrix behavior tests for each session status and unsynced draft scenarios.
 5. Local draft recovery conflict and duplicate `clientMutationId` replay tests.
 6. RLS tests: cross-user denied (`403`), same-user wrong chain (`422`).
@@ -1095,7 +1121,10 @@ Must-pass tests:
 17. Pain suppression determinism: shoulder, elbow, wrist, lower_back, upper_back, hip, knee, ankle, and other cases each produce expected suppression outcomes from `suppression_tags` mapping.
 18. Account deletion request: setting pending deletion immediately blocks app data access, returns `pendingDeletionAt` and `hardDeleteBy`, and preserves legal-retention open decision flags.
 19. Readiness checklist test fails if §10.B marked complete while §9 open decisions remain unresolved.
-### 6.1 Concrete Given/When/Then acceptance tests (integrated from former §6.A)
+
+20. Movement-intent domain enforcement: `exercise_catalog.movement_intents` and pain suppression `suppressedMovements` reject values outside canonical `movement_intent` enum.
+21. Hard disqualifier semantics: disliked is scored penalty (not filtered), pain/limitations hard-filter, experience-level filter relaxes only through fallback when alternatives absent.
+### 6.1 Concrete Given/When/Then acceptance tests
  Concrete Given/When/Then acceptance tests
 - Given two same-day slots and identical top candidate, when generator assigns slot2, then cross-slot exclusion picks next candidate.
 - Given 4-day split and previous workout used exercise X for horizontal_push, when next same-intent day generated, then X not reused unless option pool <2.
@@ -1196,7 +1225,7 @@ Blocking decisions outside this contract (if unresolved in PRD) must remain flag
 - [x] Regeneration and local-draft safety matrix fully specified.
 
 ### B) Architecture-freeze ready
-- [x] RLS/FK/trigger/RPC enforcement finalized with explicit per-table permissions and domain errors.
+- [ ] RLS/FK/trigger/RPC enforcement finalized with explicit per-table permissions and domain errors.
 - [x] Acceptance tests mapped to high-risk flows and invariants.
 - [ ] All §9 PRD open decisions closed (required before architecture-freeze can be marked complete).
 - [x] PRD open decisions explicitly listed as blockers while unresolved.
@@ -1206,7 +1235,7 @@ Blocking decisions outside this contract (if unresolved in PRD) must remain flag
 - [ ] Migration DDL generated exactly from this contract.
 - [ ] RPCs implement all state transitions and idempotency semantics.
 - [ ] Integration/e2e suite passes all §6 tests in CI.
-- [x] Placeholder/meta references to former subsection labels removed or rewritten to current section references.
+- [x] Placeholder/meta references to former subsection labels removed or rewritten to current section references where applicable.
 
 
 ## 11) Patch Summary
