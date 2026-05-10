@@ -1,6 +1,6 @@
 # CANONICAL DATA AND PLAN GENERATION CONTRACT
 
-**Status:** Implementation Freeze - Build Ready (All prior blockers resolved)  
+**Status:** Implementation Freeze - Build Ready (Final blocker patch applied)  
 **Source of truth:** `PRD.md` v0.4 Canonical Draft  
 **Revision date:** 2026-05-10
 
@@ -379,19 +379,87 @@ Response shape (both):
 `infeasibleErrors` must be non-empty when HTTP 422.
 
 
-### 5.4 Workout execution
-- `POST /v1/workout-sessions/start` -> `{data:{workoutSession}}`
-- `POST /v1/workout-sessions/{id}/set-logs` create
-- `PATCH /v1/workout-sessions/{id}/set-logs/{setLogId}` update
-- `DELETE /v1/workout-sessions/{id}/set-logs/{setLogId}` soft delete (`state='deleted'`)
-- `POST /v1/workout-sessions/{id}/set-logs/{setLogId}/skip` (`state='skipped'`)
-- `POST /v1/workout-sessions/{id}/substitutions`
-- `POST /v1/workout-sessions/{id}/complete|partial|abandon|skip`
-Status transitions:
+### 5.4 Workout execution (implementation-ready schemas)
+Common rules for all endpoints below:
+- Header `Idempotency-Key` is optional; body `mutationId` is required and is canonical for dedupe in `workout_session_mutation`.
+- `mutationHash` (server-computed from normalized request body excluding `clientTimestamp`) is persisted.
+  - same `(user_id, workout_session_id, mutationId, mutationHash)` => return original status/body (replay success).
+  - same `(user_id, workout_session_id, mutationId)` + different hash => `409 MUTATION_ID_REUSE_CONFLICT`.
+- `ifMatchVersion` is required for all mutating calls except `start`; stale version => `409 VERSION_CONFLICT`.
+- All responses include `data.workoutSession.version` after mutation and optional `idMap` for client/server reconciliation.
+- Terminal statuses: `completed|partial|abandoned|skipped|completed_outside_app|deleted`; any set-log mutation in terminal status => `409 INVALID_SESSION_STATE_TRANSITION`.
+
+`POST /v1/workout-sessions/start`
+Request required: `mutationId, clientTimestamp, workoutDayId, scheduledForDate`
+Request optional: `planVersionId` (defaults active), `notes`, `clientRequestId`
+Response 201:
+```json
+{"data":{"workoutSession":{"id":"uuid","userId":"uuid","planVersionId":"uuid","workoutDayId":"uuid","scheduledForDate":"2026-05-10","status":"in_progress","startedAt":"ISO-8601","version":1},"idMap":{}},"meta":{"mutationId":"uuid","replayed":false}}
+```
+Idempotency: replay returns same session id/status/version.
+Transition: synthetic `not_started -> in_progress` on create.
+
+`POST /v1/workout-sessions/{id}/set-logs`
+Request required: `mutationId, clientTimestamp, ifMatchVersion, setLog:{exerciseInstanceId,setSource,setIndex}`
+Request optional: `setLog:{setPrescriptionId,repsCompleted,loadValue,loadUnit,rir,clientSetLogId,substitutionGroupId}`
+Response 200: `{data:{workoutSession:{id,status,version},setLog:{...},idMap:{clientSetLogId:"uuid"}},meta:{mutationId,replayed}}`
+Validation: prescribed requires `setPrescriptionId`; added forbids it.
+
+`PATCH /v1/workout-sessions/{id}/set-logs/{setLogId}`
+Request required: `mutationId, clientTimestamp, ifMatchVersion, patch`
+Request optional patch fields: `repsCompleted,loadValue,loadUnit,rir,state` (state only `active` from active)
+Response 200: `{data:{workoutSession:{version},setLog:{...}},meta:{mutationId,replayed}}`
+
+`DELETE /v1/workout-sessions/{id}/set-logs/{setLogId}`
+Request required: `mutationId, clientTimestamp, ifMatchVersion`
+Response 200: `{data:{workoutSession:{version},setLog:{id,state:"deleted",deletedAt:"ISO-8601"}},meta:{mutationId,replayed}}`
+
+`POST /v1/workout-sessions/{id}/set-logs/{setLogId}/skip`
+Request required: `mutationId, clientTimestamp, ifMatchVersion`
+Request optional: `reasonCode, note`
+Response 200: `{data:{workoutSession:{version},setLog:{id,state:"skipped"}},meta:{mutationId,replayed}}`
+
+`POST /v1/workout-sessions/{id}/substitutions`
+Request required: `mutationId, clientTimestamp, ifMatchVersion, originalExerciseInstanceId, replacementExerciseId`
+Request optional: `reasonCode, keepSetPrescriptions:false|true(default false), clientSubstitutionId`
+Response 200: `{data:{workoutSession:{version},exerciseInstance:{id,substitutedFromExerciseInstanceId,workoutDayId,planVersionId},setPrescriptions:[...],idMap:{clientSubstitutionId:"uuid"}},meta:{mutationId,replayed}}`
+
+`POST /v1/workout-sessions/{id}/complete`
+Request required: `mutationId, clientTimestamp, ifMatchVersion`
+Request optional: `notes,painDiscomfortLocations,painDiscomfortSeverity,formBreakdownFlag,formBreakdownNotes`
+Response 200: `{data:{workoutSession:{id,status:"completed",completedAt,version}},meta:{mutationId,replayed}}`
+
+`POST /v1/workout-sessions/{id}/partial`
+Request required: `mutationId, clientTimestamp, ifMatchVersion`
+Request optional: same as complete + `partialReasonCode`
+Response 200 status `partial`.
+
+`POST /v1/workout-sessions/{id}/abandon`
+Request required: `mutationId, clientTimestamp, ifMatchVersion, abandonReasonCode`
+Request optional: `notes`
+Response 200 status `abandoned`.
+
+`POST /v1/workout-sessions/{id}/skip`
+Request required: `mutationId, clientTimestamp, ifMatchVersion, skipReasonCode`
+Request optional: `notes`
+Response 200 status `skipped`.
+
+`POST /v1/workout-sessions/{id}/completed-outside-app`
+Request required: `mutationId, clientTimestamp, ifMatchVersion, completedAt`
+Request optional: `notes, source`
+Response 200: `{data:{workoutSession:{id,status:"completed_outside_app",completedOutsideApp:true,completedAt,version}},meta:{mutationId,replayed}}`
+
+Allowed session status transitions:
 - `not_started -> in_progress|skipped|completed_outside_app|deleted`
 - `in_progress -> completed|partial|abandoned`
-- terminal: `completed|partial|abandoned|skipped|completed_outside_app|deleted`
+- `completed_outside_app` is terminal and forbids set-log create/update/delete/skip/substitution.
 
+Standard error payload:
+```json
+{"error":{"code":"VERSION_CONFLICT|INVALID_SESSION_STATE_TRANSITION|MUTATION_ID_REUSE_CONFLICT|DRAFT_CONFLICT|FOREIGN_LINK_CONFLICT","message":"...","details":{}},"meta":{"mutationId":"uuid","replayed":false}}
+```
+`DRAFT_CONFLICT` details must include authoritative mapping metadata:
+`{sessionId,serverPlanVersionId,clientPlanVersionId,lastAppliedSeq,idMap,conflictingOps:[opId...]}`.
 ### 5.5 Body weight logs
 - `POST /v1/body-weight-logs` request `{loggedOn,weightValue,weightUnit,timezone,loggedAtClient?,clientLogId?}`
 - `PATCH /v1/body-weight-logs/{id}` same mutable fields
@@ -418,28 +486,70 @@ Response includes computed fields: `{weightKg,weeklyAvgKg,weeklyTrendKg}`.
 
 ---
 
-## 6) Generator templates (explicit 5-day and 6-day)
+## 6) Generator templates (explicit 2-day through 6-day)
 
-## 6.1 5-day intermediate template
+Notation: `movement_intent(set_count, rep_range, trim_priority, optional?)`, where `optional?` uses `opt`.
+Beginner reductions are deterministic: same slot order as intermediate; apply `set_count = max(set_count-1,2)` for all movements with original set_count >=3; movements with 2 sets remain 2.
+
+### 6.1 2-day intermediate template
+- Day 1 Full Body A: `squat_pattern(4,5-8,p1)`, `horizontal_push(4,6-10,p1)`, `horizontal_pull(4,6-10,p1)`, `hinge_pattern(3,6-10,p2)`, `core_anti_extension(3,10-15,p3)`, `lateral_raise_pattern(3,12-20,p4,opt)`
+- Day 2 Full Body B: `hip_thrust_pattern(4,6-10,p1)`, `vertical_push(3,8-12,p2)`, `vertical_pull(4,6-10,p1)`, `lunge_pattern(3,8-12,p2)`, `core_anti_rotation(3,10-15,p3)`, `calf_plantarflexion(3,10-15,p4,opt)`
+
+### 6.2 2-day beginner template
+- Day 1 Full Body A: `squat_pattern(3,5-8,p1)`, `horizontal_push(3,6-10,p1)`, `horizontal_pull(3,6-10,p1)`, `hinge_pattern(2,6-10,p2)`, `core_anti_extension(2,10-15,p3)`, `lateral_raise_pattern(2,12-20,p4,opt)`
+- Day 2 Full Body B: `hip_thrust_pattern(3,6-10,p1)`, `vertical_push(2,8-12,p2)`, `vertical_pull(3,6-10,p1)`, `lunge_pattern(2,8-12,p2)`, `core_anti_rotation(2,10-15,p3)`, `calf_plantarflexion(2,10-15,p4,opt)`
+
+### 6.3 3-day intermediate template
+- Day 1 Upper A: `horizontal_push(4,6-10,p1)`, `horizontal_pull(4,6-10,p1)`, `vertical_push(3,8-12,p2)`, `vertical_pull(3,8-12,p2)`, `elbow_extension_isolation(3,8-15,p3,opt)`
+- Day 2 Lower: `squat_pattern(4,5-8,p1)`, `hinge_pattern(3,6-10,p1)`, `lunge_pattern(3,8-12,p2)`, `knee_flexion_isolation(3,10-15,p3)`, `core_anti_extension(3,10-15,p3)`
+- Day 3 Upper B: `vertical_pull(4,6-10,p1)`, `horizontal_push(3,8-12,p2)`, `horizontal_pull(3,8-12,p2)`, `lateral_raise_pattern(3,12-20,p4,opt)`, `elbow_flexion_isolation(3,8-15,p3)`
+
+### 6.4 3-day beginner template
+- Day 1 Upper A: `horizontal_push(3,6-10,p1)`, `horizontal_pull(3,6-10,p1)`, `vertical_push(2,8-12,p2)`, `vertical_pull(2,8-12,p2)`, `elbow_extension_isolation(2,8-15,p3,opt)`
+- Day 2 Lower: `squat_pattern(3,5-8,p1)`, `hinge_pattern(2,6-10,p1)`, `lunge_pattern(2,8-12,p2)`, `knee_flexion_isolation(2,10-15,p3)`, `core_anti_extension(2,10-15,p3)`
+- Day 3 Upper B: `vertical_pull(3,6-10,p1)`, `horizontal_push(2,8-12,p2)`, `horizontal_pull(2,8-12,p2)`, `lateral_raise_pattern(2,12-20,p4,opt)`, `elbow_flexion_isolation(2,8-15,p3)`
+
+### 6.5 4-day intermediate template
+- Day 1 Upper Push/Pull A: `horizontal_push(4,6-10,p1)`, `horizontal_pull(4,6-10,p1)`, `vertical_push(3,8-12,p2)`, `lateral_raise_pattern(3,12-20,p4,opt)`, `elbow_extension_isolation(3,8-15,p3)`
+- Day 2 Lower A: `squat_pattern(4,5-8,p1)`, `hinge_pattern(3,6-10,p1)`, `calf_plantarflexion(3,10-15,p4,opt)`, `core_anti_extension(3,10-15,p3)`
+- Day 3 Upper Push/Pull B: `vertical_pull(4,6-10,p1)`, `horizontal_push(3,8-12,p2)`, `horizontal_pull(3,8-12,p2)`, `rear_delt_raise_pattern(3,12-20,p4,opt)`, `elbow_flexion_isolation(3,8-15,p3)`
+- Day 4 Lower B: `hip_thrust_pattern(4,6-10,p1)`, `lunge_pattern(3,8-12,p2)`, `knee_flexion_isolation(3,10-15,p3)`, `core_anti_rotation(3,10-15,p3)`
+
+### 6.6 4-day beginner template
+- Day 1 Upper Push/Pull A: `horizontal_push(3,6-10,p1)`, `horizontal_pull(3,6-10,p1)`, `vertical_push(2,8-12,p2)`, `lateral_raise_pattern(2,12-20,p4,opt)`, `elbow_extension_isolation(2,8-15,p3)`
+- Day 2 Lower A: `squat_pattern(3,5-8,p1)`, `hinge_pattern(2,6-10,p1)`, `calf_plantarflexion(2,10-15,p4,opt)`, `core_anti_extension(2,10-15,p3)`
+- Day 3 Upper Push/Pull B: `vertical_pull(3,6-10,p1)`, `horizontal_push(2,8-12,p2)`, `horizontal_pull(2,8-12,p2)`, `rear_delt_raise_pattern(2,12-20,p4,opt)`, `elbow_flexion_isolation(2,8-15,p3)`
+- Day 4 Lower B: `hip_thrust_pattern(3,6-10,p1)`, `lunge_pattern(2,8-12,p2)`, `knee_flexion_isolation(2,10-15,p3)`, `core_anti_rotation(2,10-15,p3)`
+
+### 6.7 5-day intermediate template
 - D1: `horizontal_push(4,6-10,p1)`, `horizontal_pull(4,6-10,p1)`, `vertical_push(3,8-12,p2)`, `vertical_pull(3,8-12,p2)`, `lateral_raise_pattern(3,12-20,p4,opt)`
 - D2: `squat_pattern(4,5-8,p1)`, `hinge_pattern(3,6-10,p1)`, `lunge_pattern(3,8-12,p2)`, `calf_plantarflexion(3,10-15,p4,opt)`, `core_anti_extension(3,10-15,p3)`
 - D3: `vertical_pull(4,6-10,p1)`, `horizontal_pull(3,8-12,p1)`, `rear_delt_raise_pattern(3,12-20,p3,opt)`, `elbow_flexion_isolation(3,8-15,p3)`
 - D4: `hinge_pattern(4,5-8,p1)`, `hip_thrust_pattern(3,8-12,p2)`, `knee_flexion_isolation(3,10-15,p3)`, `calf_plantarflexion(3,10-15,p4,opt)`, `core_anti_rotation(3,10-15,p3)`
 - D5: `horizontal_push(3,8-12,p2)`, `elbow_extension_isolation(3,8-15,p3)`, `elbow_flexion_isolation(3,8-15,p3)`, `lateral_raise_pattern(3,12-20,p4,opt)`, `core_flexion(3,10-20,p4,opt)`
 
-## 6.2 6-day intermediate template
+### 6.8 6-day intermediate template
 - Push A: `horizontal_push(4,6-10,p1)`, `vertical_push(3,8-12,p2)`, `elbow_extension_isolation(3,8-15,p3)`, `lateral_raise_pattern(3,12-20,p4,opt)`
 - Pull A: `vertical_pull(4,6-10,p1)`, `horizontal_pull(3,8-12,p2)`, `elbow_flexion_isolation(3,8-15,p3)`, `rear_delt_raise_pattern(3,12-20,p4,opt)`
 - Legs A: `squat_pattern(4,5-8,p1)`, `hinge_pattern(3,6-10,p1)`, `calf_plantarflexion(3,10-15,p4,opt)`, `core_anti_extension(3,10-15,p3)`
 - Push B: `horizontal_push(3,8-12,p1)`, `vertical_push(3,8-12,p2)`, `elbow_extension_isolation(3,10-15,p3)`, `lateral_raise_pattern(3,12-20,p4,opt)`
 - Pull B: `horizontal_pull(4,6-10,p1)`, `vertical_pull(3,8-12,p2)`, `elbow_flexion_isolation(3,10-15,p3)`, `rear_delt_raise_pattern(3,12-20,p4,opt)`
 - Legs B: `hip_thrust_pattern(4,6-10,p1)`, `lunge_pattern(3,8-12,p2)`, `knee_flexion_isolation(3,10-15,p3)`, `core_anti_rotation(3,10-15,p3)`
-
-Beginner rule: same slots, accessory sets -1 (floor 2).
-
 ---
 
-## 7) Set prescription/log linkage and substitution rules
+## 7) Set prescription/log linkage, cross-entity integrity, and substitution rules
+- Invariant enforcement matrix:
+  1. `set_log.user_id = workout_session.user_id` -> DB trigger/check function + service validation + acceptance test.
+  2. `set_log.exercise_instance_id` owned by same user -> RLS read barrier + service validation + acceptance test.
+  3. `set_log.set_prescription_id` (if present) belongs to same `exercise_instance_id` -> DB trigger/check function + service validation + acceptance test.
+  4. `exercise_instance.workout_day_id = workout_session.workout_day_id` -> service validation + trigger/check function (on insert/update).
+  5. `exercise_instance.plan_version_id = workout_session.plan_version_id` except valid substitution rows -> service validation + trigger/check function with substitution exception branch.
+  6. `set_prescription.workout_day_id = exercise_instance.workout_day_id` -> DB trigger/check function + acceptance test.
+  7. Cross-user linking impossible with malicious UUIDs -> RLS policy + service validation + acceptance tests.
+- Required SQL primitives:
+  - `fn_validate_set_log_links()` BEFORE INSERT/UPDATE on `set_log`.
+  - `fn_validate_prescription_day_alignment()` BEFORE INSERT/UPDATE on `set_prescription`.
+  - both raise SQLSTATE `23514` mapped to API `FOREIGN_LINK_CONFLICT`.
 - `set_log.set_prescription_id` links directly to planned set when `set_source='prescribed'`.
 - Added sets use `set_source='added'` and null `set_prescription_id`.
 - Substitution creates new `exercise_instance` linked via `substituted_from_exercise_instance_id`; existing logs stay immutable and linked to their originating instance.
@@ -447,30 +557,47 @@ Beginner rule: same slots, accessory sets -1 (floor 2).
 
 ---
 
-## 8) Nutrition safety bounds (unchanged MVP)
+## 8) Recommendation payload schemas (MVP, rules-based explainable JSON)
+`recommendation.payload` must validate against `payload.type`-specific schema. Common required fields for all types:
+- `type`, `targetEntityType`, `targetEntityId`, `exerciseId`, `exerciseInstanceId`, `previousPerformanceSummary`, `reasonCodes[]`, `explanationText`, `suggestedChange`, `safetyFlagsConsidered[]`, `requiresUserApproval`, `expiresAt`, `generatedByRuleVersion`.
+
+Type specifics:
+- `add_reps`: `suggestedChange:{repDelta:int>0,newRepTargetMin:int,newRepTargetMax:int}`.
+- `add_load`: `suggestedChange:{loadDelta:number>0,loadUnit:"kg|lb",newLoadTarget:number}`.
+- `hold_load`: `suggestedChange:{holdForSessions:int>=1,loadUnit:"kg|lb",loadTarget:number}`.
+- `reduce_load`: `suggestedChange:{loadDelta:number<0,loadUnit:"kg|lb",newLoadTarget:number,deloadPercent:number}`.
+- `substitute_exercise`: `suggestedChange:{replaceExerciseInstanceId:"uuid",replacementExerciseId:"uuid",reason:"equipment|pain|progress_stall"}`.
+- `suggest_deload`: `suggestedChange:{durationSessions:int>=1,volumeReductionPercent:number,loadReductionPercent:number}`.
+
+Auditability requirements:
+- `previousPerformanceSummary` includes at minimum `windowSessions`, `avgReps`, `avgRir`, `completionRate`, `painFlagsSeen`.
+- `reasonCodes` drawn from controlled enum and persisted exactly as evaluated (no AI free-text dependency).
+- `explanationText` must be user-readable deterministic template text produced from reason codes + metrics.
+- Expiration behavior: recommendation auto-transitions to `expired` when `expiresAt < now()` and not `accepted|ignored`.
+
+## 9) Nutrition safety bounds (unchanged MVP)
 - Hard reject: calories `<1200` or `>5000`, deficit `>30%`, surplus `>20%`, protein `<0.8 g/kg` or `>2.4 g/kg`.
 - Warn but allow: deficit `20-30%`, surplus `15-20%`, protein `0.8-1.2` or `2.2-2.4 g/kg`.
 - Missing required anthropometrics => require manual maintenance estimate.
 
 ---
 
-## 9) Acceptance tests (expanded)
-1. Equipment item full-replace persists and removes omitted items.
-2. `PUT /equipment/profiles/{id}/items` idempotent replay behavior is correct.
-3. Body weight uniqueness on `(user_id, logged_on)` enforced.
-4. Weekly trend matches 7-day window formula.
-5. SetLog uniqueness and prescribed-link constraints enforced.
-6. Added sets accepted without `set_prescription_id` and never collide with prescribed unique key.
-7. Skip/delete behaviors persist across sync and replay.
-8. RLS denies cross-user access on child tables (`exercise_instance`,`set_prescription`,`set_log`).
-9. `completed_outside_app` flow behaves as terminal status and excluded from in-app set logging.
-10. Session statuses include `not_started` and `deleted`; missed-workout logic references `not_started` only.
-11. Generator deterministically selects same exercise catalog rows for same input.
-12. Plan-generation output matches required shape (`planVersion`,`workoutDays`,`exerciseInstances`,`setPrescriptions`,`explanations`,`warnings`,`infeasibleErrors`).
-13. 5-day and 6-day template slot order and trim priorities are deterministic.
-14. Regeneration preserves in-progress session binding and only rebinds eligible not-started future sessions.
-15. Mutation ID hash mismatch returns `409 MUTATION_ID_REUSE_CONFLICT` with stored operation metadata.
-
+## 10) Acceptance tests (expanded)
+1. 2-day plan generation produces deterministic day labels, slot order, movement intents, sets, reps, trim priorities, optional flags.
+2. 3-day plan generation produces deterministic output with same-input same-output snapshots.
+3. 4-day plan generation produces deterministic output with stable exercise selection ordering.
+4. Beginner templates apply conservative set reductions exactly per rule (max(set-1,2)).
+5. Invalid `set_log` referencing `set_prescription_id` from different `exercise_instance_id` is rejected with `409 FOREIGN_LINK_CONFLICT`.
+6. Invalid `set_log` referencing another user’s `exercise_instance_id` or `set_prescription_id` is rejected (RLS + service), no cross-user link persisted.
+7. Regeneration with unsynced local draft returns `409 DRAFT_CONFLICT` with `sessionId,serverPlanVersionId,clientPlanVersionId,lastAppliedSeq,idMap,conflictingOps`.
+8. Regeneration preserves in-progress session binding and completed session history immutably.
+9. Infeasible generation returns HTTP `422` and non-empty `infeasibleErrors`.
+10. Workout execution mutation replay with same hash returns stored response/body/status with `meta.replayed=true`.
+11. Workout execution mutation replay with same mutation ID but different hash returns `409 MUTATION_ID_REUSE_CONFLICT`.
+12. `completed_outside_app` is terminal and blocks subsequent in-app set logging/substitution endpoints with `409 INVALID_SESSION_STATE_TRANSITION`.
+13. Equipment item full-replace persists and removes omitted items.
+14. Body weight uniqueness on `(user_id, logged_on)` enforced.
+15. Weekly trend matches 7-day window formula.
 ## 5.8 Local workout draft sync contract
 Local draft object (per session):
 ```json
