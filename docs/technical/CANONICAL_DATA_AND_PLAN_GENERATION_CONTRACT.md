@@ -164,10 +164,21 @@ Columns:
 - `id uuid pk`
 - `exercise_key text not null unique`
 - `name text not null`
+- `movement_intents text[] not null`
 - `primary_muscles text[] not null`
 - `secondary_muscles text[] not null default '{}'`
 - `movement_pattern text not null`
 - `equipment_keys text[] not null`
+- `difficulty smallint not null check (difficulty between 1 and 5)`
+- `fatigue_cost smallint not null check (fatigue_cost between 1 and 5)`
+- `tempo_seconds smallint not null check (tempo_seconds between 1 and 20)`
+- `rest_seconds smallint not null check (rest_seconds between 15 and 600)`
+- `warmup_overhead smallint not null check (warmup_overhead between 0 and 900)`
+- `setup_overhead smallint not null check (setup_overhead between 0 and 900)`
+- `cue_setup text not null check (char_length(cue_setup) between 10 and 500)`
+- `cue_execution text not null check (char_length(cue_execution) between 10 and 500)`
+- `cue_common_mistake text not null check (char_length(cue_common_mistake) between 10 and 500)`
+- `cue_safety_note text not null check (char_length(cue_safety_note) between 10 and 500)`
 - `experience_level_min experience_level not null`
 - `is_unilateral boolean not null default false`
 - `is_active boolean not null default true`
@@ -176,8 +187,9 @@ Columns:
 - `updated_at timestamptz not null default now()`
 
 Constraints/indexes:
-- GIN indexes on `primary_muscles`, `equipment_keys`.
-- check arrays non-empty where required.
+- GIN indexes on `movement_intents`, `primary_muscles`, `equipment_keys`.
+- checks: `cardinality(movement_intents)>=1`, `cardinality(primary_muscles)>=1`, `cardinality(equipment_keys)>=1`.
+- all cue/timing columns required (non-null) for seeded active exercises.
 
 Seed count contract:
 - MVP ships **~80 curated exercises**; exact count is product-controlled seed decision and may vary slightly.
@@ -308,9 +320,11 @@ Columns:
 - `id uuid pk`
 - `user_id uuid not null fk auth.users(id) on delete cascade`
 - `exercise_instance_id uuid not null fk exercise_instance(id) on delete cascade`
-- `set_number smallint not null check (set_number >= 1)`
-- `rep_min smallint not null check (rep_min between 1 and 50)`
-- `rep_max smallint not null check (rep_max between rep_min and 60)`
+- `set_type text not null check (set_type in ('working','warmup'))`
+- `set_index smallint not null check (set_index >= 1)`
+- `set_number smallint generated always as (set_index) stored`
+- `target_rep_min smallint not null check (target_rep_min between 1 and 50)`
+- `target_rep_max smallint not null check (target_rep_max between target_rep_min and 60)`
 - `load_value numeric(6,2) null`
 - `load_unit weight_unit null`
 - `target_rir_min numeric(3,1) null`
@@ -319,7 +333,7 @@ Columns:
 - `created_at timestamptz not null default now()`
 
 Constraints:
-- `unique (exercise_instance_id, set_number)`
+- `unique (exercise_instance_id, set_index)`
 - `check ((target_rir_min is null and target_rir_max is null) or (target_rir_min is not null and target_rir_max is not null and target_rir_min >= 0 and target_rir_max <= 5 and target_rir_min <= target_rir_max))`
 
 ### 2.14 `workout_session`
@@ -353,6 +367,7 @@ Columns:
 - `exercise_instance_id uuid not null fk exercise_instance(id)`
 - `set_prescription_id uuid null fk set_prescription(id)`
 - `set_source set_source not null`
+- `set_log_index smallint not null check (set_log_index >= 1)`
 - `set_state set_state not null default 'active'`
 - `performed_reps smallint null check (performed_reps between 0 and 100)`
 - `performed_load numeric(6,2) null`
@@ -366,7 +381,11 @@ Columns:
 
 Constraints/indexes:
 - `unique (user_id, workout_session_id, client_mutation_id)`
+- `unique (workout_session_id, exercise_instance_id, set_log_index)`
 - index `(workout_session_id, exercise_instance_id)`
+- if `set_source='prescribed'` then `set_prescription_id is not null`; if `set_source='added'` then `set_prescription_id is null`.
+- prescribed set logs must reference a `set_prescription` whose `exercise_instance_id` equals set log `exercise_instance_id` and belongs to same `workout_session.plan_version_id` chain.
+- added set logs are allowed for user edits but cannot be marked prescribed by trigger rewrite/validation.
 
 ### 2.16 `post_workout_check_in`
 **Purpose:** Post-session recovery/safety check aligned with PRD.
@@ -419,6 +438,191 @@ Constraints/indexes:
 - check `ignored_reason is null unless status='ignored'`.
 
 ---
+
+## 2.A) Plan Generator Contract (deterministic, implementation-ready)
+
+### 2.A.1 Movement-intent slot taxonomy
+`movement_intent` enum domain used by generator and catalog:
+- `knee_dominant_squat`
+- `hip_hinge`
+- `horizontal_push`
+- `vertical_push`
+- `horizontal_pull`
+- `vertical_pull`
+- `single_leg`
+- `core_anti_extension`
+- `core_anti_rotation`
+- `arm_elbow_flexion`
+- `arm_elbow_extension`
+- `lateral_deltoid`
+- `rear_deltoid`
+- `calf_plantarflexion`
+
+Generator slot object schema:
+- `slotId text not null`
+- `dayIndex smallint not null`
+- `slotIndex smallint not null`
+- `movementIntent movement_intent not null`
+- `isAccessory boolean not null`
+- `targetSets smallint not null`
+- `targetRepMin smallint not null`
+- `targetRepMax smallint not null`
+- `targetRirMin numeric(3,1) null`
+- `targetRirMax numeric(3,1) null`
+
+### 2.A.2 Split templates by days/week
+- 2 days/week: full-body A/B; each day requires 1 squat/leg, 1 hinge/posterior, 1 push, 1 pull, 1 accessory/core.
+- 3 days/week: full-body A/B/C; each day includes lower + upper push/pull + one accessory.
+- 4 days/week: upper/lower split (Upper A, Lower A, Upper B, Lower B).
+- 5 days/week: push/pull/legs + upper/lower hybrid.
+- 6 days/week: push/pull/legs repeated with A/B exercise variation.
+Template resolution is deterministic by `(daysPerWeek, goalType, experienceLevel)` with fixed slot counts per template.
+
+### 2.A.3 Initial weekly volume targets (working sets)
+- beginner: major groups 8–12 sets/week; minor groups 4–8.
+- intermediate: major groups 10–16; minor groups 6–10.
+Goal adjustment:
+- bulk: +2 sets/week to chest, back, quads, hamstrings.
+- cut: -2 sets/week global floor 6 major / 3 minor.
+- recomp: baseline.
+
+### 2.A.4 Duration estimation formula and accessory-cut priority
+Estimated session duration formula:
+`sum(sets * (avgRepSeconds * avgTargetReps + restSeconds + transitionSeconds)) + warmupOverhead + setupOverhead`
+Constants:
+- `avgRepSeconds = 4`
+- `transitionSeconds = 20` between sets
+- use exercise-specific `rest_seconds`, `tempo_seconds`, `warmup_overhead`, `setup_overhead` from catalog.
+If estimated duration exceeds `goal_plan.session_length_min` by >10%:
+cut order (highest priority cut first):
+1) `arm_elbow_flexion`
+2) `arm_elbow_extension`
+3) `lateral_deltoid`
+4) `rear_deltoid`
+5) `calf_plantarflexion`
+6) secondary core slot
+Never cut below template-required compound intents.
+
+### 2.A.5 Hard disqualifiers
+Candidate exercise is ineligible if any true:
+- inactive in `exercise_catalog`.
+- required equipment not in active equipment profile.
+- user limitation with severity `hard_block` intersects movement intent, muscle, or equipment.
+- exercise marked disliked with active pain flag for matching location in last 14 days.
+- experience level below `experience_level_min`.
+
+### 2.A.6 Selection rule precedence, scoring weights, tie-breakers
+Precedence:
+1. hard disqualifiers
+2. safety suppressions from check-ins/limitations
+3. template slot fit
+4. duration budget compliance
+5. variety constraints
+6. preference optimization
+Score (0-100):
+- movement-intent fit: 30
+- equipment fit simplicity: 15
+- preference signal: 15
+- fatigue-cost alignment: 15
+- recency penalty inversion (less recent = better): 15
+- unilateral/bilateral slot match: 10
+Tie-breakers in order:
+1) lower fatigue_cost
+2) lower setup_overhead
+3) less used in previous 21 days
+4) lexical `exercise_key` ascending (determinism)
+
+### 2.A.7 Cross-slot exclusion, variety enforcement, unfillable-slot fallback
+Cross-slot exclusion in same day:
+- cannot assign same `exercise_catalog_id` to >1 slot.
+- cannot assign two hinge-intent heavy spinal-loading lifts if both fatigue_cost >=4.
+Variety enforcement:
+- no exact exercise repeat across consecutive workouts for same intent unless option pool <2.
+- weekly unique count minimum: 1 unique per compound intent for 2-3 days; 2 unique per compound intent for 4-6 days.
+Unfillable fallback order:
+1) substitute nearest intent from approved adjacency map.
+2) reduce set count of adjacent slot and add time-neutral alternative.
+3) mark slot `unfilled` and emit validation warning with reason code.
+
+### 2.A.8 Calibration checkpoint
+After first 2 completed sessions in new plan version:
+- recompute per-slot difficulty using achieved reps/RIR.
+- if >70% working sets report RIR 0-1, lower planned load 2.5-5% for affected intent.
+- if >70% sets hit top reps with RIR >=3, raise planned load 2.5%.
+No structural slot changes at checkpoint; load/rep tuning only.
+
+### 2.A.9 Substitution algorithm and load handling
+Substitution trigger: unavailable equipment, pain suppression, user skip-request per exercise.
+Algorithm:
+1) find candidate pool with same movement_intent.
+2) if empty, use adjacent intent map with penalty -15 score.
+3) re-score with current constraints.
+4) choose top deterministic candidate.
+Load handling:
+- if old and new have same load modality, carry load unchanged.
+- if bilateral -> unilateral dumbbell, set each side load to `roundToNearest(0.5, old_load * 0.5)`.
+- if barbell -> machine/cable unknown ratio, clear load and keep rep/RIR targets.
+- warmup sets regenerated from working set estimate tables.
+
+### 2.A.10 Generator outputs
+Plan-level explanation output schema (`plan_version.validation_warnings_json` companion API field `planExplanation`):
+- `templateChosen`
+- `equipmentConstraintsApplied[]`
+- `limitationSuppressions[]`
+- `durationAdjustments[]`
+- `substitutionsApplied[]`
+Validation warning object schema:
+- `code text`
+- `severity enum(info|warning|blocking)`
+- `message text`
+- `slotId text null`
+Movement coverage summary output:
+- per movement intent: `targetSets`, `assignedSets`, `coverageStatus enum(full|partial|missing)`.
+
+## 2.B) Progression and Recommendation Rules (implementation-ready)
+
+### 2.B.1 Double-progression algorithm
+For each working set in an exercise intent block:
+- keep load fixed until user hits `targetRepMax` for all working sets at/above `targetRirMin` and at/below `targetRirMax` in 2 consecutive exposures.
+- then increase load by increment table and reset target to lower rep boundary.
+Increment table:
+- barbell lower: +5 kg / +10 lb
+- barbell upper: +2.5 kg / +5 lb
+- dumbbell/cable/machine: next available step (usually +1 to +2.5 kg each side)
+
+### 2.B.2 Recommendation precedence and thresholds
+Precedence (highest first): pain/safety suppression > deload > reduce > hold > add load > add reps.
+Thresholds evaluated from last 2 exposures for same exercise intent:
+- add-load: all working sets at target_rep_max with average RIR >= targetRirMin and <= targetRirMax+0.5.
+- hold: at least 70% sets within rep range and RIR within target band.
+- reduce: fewer than 50% sets achieve target_rep_min or form_breakdown true once with RIR <=0.5.
+- deload: two consecutive sessions with reduce condition OR fatigue_level high + soreness high + form_breakdown true.
+RIR behavior:
+- RIR < targetRirMin on majority sets suppresses add-load.
+- RIR > targetRirMax+1 for two exposures triggers add-reps recommendation first, then add-load.
+Fatigue/form behavior:
+- fatigue high or form_breakdown true limits recommendations to hold/reduce/deload.
+Pain/safety suppression:
+- active pain_flag for location mapped to movement intent blocks add-load/add-reps and enables substitute/reduce/deload only.
+
+### 2.B.3 Ignored recommendation feedback rules
+When user ignores same recommendation type for same target 3 times in 21 days:
+- cooldown 14 days for that type+target.
+- future recommendations require confidence score +10 over normal threshold.
+`ignoredReason=no_reason_given` does not alter thresholds; explicit reasons do.
+
+### 2.B.4 Structured reason object and Why? requirements
+Each recommendation includes machine-readable reason object:
+- `reasonCode`
+- `observedMetrics` {repsHitRate, avgRir, fatigueLevel, painFlag, formBreakdownCount}
+- `thresholdsEvaluated` array
+- `decisionPath` ordered strings
+API must expose `why` block with:
+- short explanation <= 220 chars
+- detailed explanation <= 1200 chars
+- top 3 contributing factors with signed effect size.
+
+
 
 ## 3) API contract (full endpoints)
 
@@ -652,3 +856,123 @@ Blocking decisions outside this contract (if unresolved in PRD) must remain flag
 - [ ] RPCs implement all state transitions and idempotency semantics.
 - [ ] Integration/e2e suite passes all §6 tests in CI.
 - [ ] No placeholder language remains.
+
+
+## 11) Patch Summary
+- Sections added: §2.A Plan Generator Contract, §2.B Progression and Recommendation Rules.
+- Sections amended: §2.6 exercise_catalog schema, §2.13 set_prescription, §2.15 set_log, §3 API contract, §5 enforcement, §6 acceptance tests, §3.11 local draft recovery.
+- Sections deleted: none.
+- Remaining blockers before implementation readiness: endpoint-level request/response JSON schemas must be represented as strict field lists for every endpoint in §3; currently several endpoints remain abbreviated and require full schema expansion.
+
+## 3.A) Endpoint schema expansion (authoritative supplement to §3.1–§3.11)
+For each endpoint in §3, the following are mandatory and not optional: method/path, auth, required headers, strict request schema, strict success schema, error codes, idempotency behavior, versionToken behavior, transaction notes, RLS ownership checks.
+
+### 3.A.1 Shared request/response envelopes
+- Request headers for authenticated mutable endpoints: `Authorization`, `Content-Type: application/json`, `Idempotency-Key`.
+- Success envelope: `{ "data": <resource>, "meta": { "requestId": "uuid", "idempotencyReplay": false } }`.
+- Error envelope: `{ "error": { "code": "...", "message": "...", "details": {...} } }`.
+
+### 3.A.2 Full schema obligations by endpoint group
+- Plans endpoints (§3.1): body must include all required IDs, optional fields explicitly nullable; response must include planVersion with workoutDays[] -> exercises[] -> setPrescriptions[] and `planExplanation`, `validationWarnings`, `movementCoverageSummary`.
+- Workout session endpoints (§3.2): response includes `status`, `versionToken`, `startedAt`, `endedAt`, `scheduledForDate`.
+- Set logs endpoint (§3.3): entries require `clientMutationId`, `exerciseInstanceId`, `setSource`, `setLogIndex`, reps/load/RIR fields; `setPrescriptionId` required only for prescribed sets.
+- Recovery endpoint (§3.4): includes action enum, optional targetDate, and explicit `versionToken`; returns both updated session and optional created planVersion summary.
+- Limitations endpoints (§3.5): enforce typed arrays for affected muscles/equipment, versionToken on patch/resolve.
+- Post-workout check-in (§3.6): full schema required with pain conditional validation.
+- Notification endpoints (§3.7): patch requires versionToken and timezone string.
+- Recommendation actions (§3.8): include versionToken; ignore requires `ignoredReason` enum.
+- Equipment item deletion (§3.9): requires `equipmentProfileVersionToken`; returns incremented parent token.
+- Public sample plan (§3.10): no auth, no user-owned writes, rate limits.
+- Local draft recovery (§3.11): strict local draft schema in §3.B.
+
+### 3.A.3 Endpoint-level idempotency and versionToken behavior
+- `POST /v1/plans/generate`: idempotent by key+body; no versionToken required.
+- `POST /v1/plans/{id}/accept|regenerate|revert`: require versionToken; stale -> `409 VERSION_CONFLICT`.
+- `POST /v1/workout-sessions/start`: idempotent create by key+day+date.
+- `POST /v1/workout-sessions/{id}/resume|finish|mark-partial|skip|complete-outside-app`: require versionToken; duplicate key replay returns same transition result.
+- `POST /v1/workout-sessions/{id}/set-logs`: dedupe by `(user_id, workout_session_id, client_mutation_id)`; replay returns prior row IDs.
+- `PUT /v1/workout-sessions/{id}/post-workout-check-in`: idempotent upsert semantics by session.
+- `PATCH /v1/notification-preferences`, limitation patch/resolve, recommendation actions: optimistic concurrency required.
+
+## 3.B) Local draft recovery (full schema and conflict matrix)
+Local draft payload schema:
+- `localDraftId string not null`
+- `planVersionId uuid not null`
+- `workoutDayId uuid not null`
+- `workoutSessionId uuid null`
+- `startedAt timestamptz not null`
+- `completedSetLogs[]` each with `clientMutationId`, `exerciseInstanceId`, `setSource`, `setLogIndex`, `setPrescriptionId?`, `performedReps?`, `performedLoad?`, `loadUnit?`, `rir?`, `setState`.
+- `skippedExercises[]` with `exerciseInstanceId`, `reason?`
+- `skippedSets[]` with `exerciseInstanceId`, `setLogIndex`, `reason?`
+- `notes string null`
+- `lastSavedAt timestamptz not null`
+- `syncStatus enum('not_synced','partially_synced','synced','conflicted')`
+- `sessionVersionToken integer null`
+
+Recovery path A (existing workoutSessionId):
+1) validate ownership and session open state.
+2) validate `planVersionId/workoutDayId` chain equals existing session.
+3) apply idempotent set log upserts by `clientMutationId`.
+4) return `duplicateClientMutationIds[]` and accepted IDs.
+
+Recovery path B (creation context before first sync):
+1) create session from `planVersionId+workoutDayId+scheduledForDate(derived)` in transaction.
+2) insert recovered set logs/check-in snapshot.
+3) return created `workoutSessionId` and server `versionToken`.
+
+Conflict handling codes:
+- `SESSION_ALREADY_COMPLETED`: do not append logs; return latest server session snapshot.
+- `PLAN_VERSION_MISMATCH`: reject with expected/current IDs.
+- `WORKOUT_DAY_MISMATCH`: reject with expected/current IDs.
+- `STALE_VERSION_TOKEN`: reject with `currentVersionToken`.
+- `DUPLICATE_CLIENT_MUTATION_ID`: non-fatal replay list in success payload.
+- `PARTIAL_SYNC_CONFLICT`: return merged summary + unresolved item list.
+
+## 5.A) RLS/FK/trigger/RPC enforcement expansion
+Per-table RLS matrix (C=client, S=service):
+- user-owned mutable tables (`user_profile`, `goal_plan`, `equipment_profile`, `equipment_profile_item`, `user_exercise_preference`, `user_limitation`, `notification_preference`, `workout_session`, `set_log`, `post_workout_check_in`, `recommendation`): C select/update/insert/delete with `user_id=auth.uid()` checks as applicable.
+- generated plan structure (`plan_version`, `workout_day`, `exercise_instance`, `set_prescription`): C select only; writes via RPC under S.
+- catalogs (`exercise_catalog`, `equipment_catalog`): C select only active rows; S write.
+Service-role-only tables matrix: `exercise_catalog`, `equipment_catalog`, `plan_version`, `workout_day`, `exercise_instance`, `set_prescription` direct writes.
+
+Named RPC list and contracts:
+- `rpc_generate_plan(goal_plan_id uuid, equipment_profile_id uuid, preferred_weekdays week_day[]) -> plan_version_payload` errors: `422 GENERATION_UNFILLABLE`, `403`.
+- `rpc_accept_plan(plan_version_id uuid, version_token int) -> plan_version` errors: `409 VERSION_CONFLICT`.
+- `rpc_regenerate_plan(plan_version_id uuid, version_token int, reason text) -> plan_version_payload`.
+- `rpc_revert_plan(plan_version_id uuid, version_token int) -> plan_version_payload`.
+- `rpc_transition_workout_session(session_id uuid, action text, version_token int, payload jsonb) -> workout_session`.
+- `rpc_append_set_logs(session_id uuid, version_token int, entries jsonb) -> set_log_result`.
+- `rpc_recover_local_draft(payload jsonb) -> recovery_result`.
+- `rpc_apply_recommendation_action(recommendation_id uuid, action text, version_token int, ignored_reason text) -> recommendation`.
+
+Trigger names/responsibilities:
+- `trg_set_updated_at_*`: set `updated_at=now()`.
+- `trg_bump_version_token_*`: increment `version_token` on successful mutable update.
+- `trg_enforce_user_ownership_chain`: assert child-parent `user_id` equality.
+- `trg_set_log_prescribed_chain_guard`: validate prescribed set references same exercise/session/plan chain.
+- `trg_equipment_profile_item_parent_token_bump`: bump parent `equipment_profile.version_token` +1 on insert/update/delete.
+
+FK chain validation examples:
+- set log prescribed chain: `set_log.workout_session_id -> workout_session.workout_day_id -> exercise_instance.workout_day_id`, and `set_log.set_prescription_id -> set_prescription.exercise_instance_id == set_log.exercise_instance_id`.
+- same-user wrong chain returns `422 FK_OWNERSHIP_VIOLATION` even when user owns both rows independently.
+
+## 6.A) Concrete Given/When/Then acceptance tests
+- Given two same-day slots and identical top candidate, when generator assigns slot2, then cross-slot exclusion picks next candidate.
+- Given 4-day split and previous workout used exercise X for horizontal_push, when next same-intent day generated, then X not reused unless option pool <2.
+- Given missing equipment for vertical_pull and no eligible alternatives, when generating, then slot marked unfilled and warning emitted.
+- Given session length cap 45 min and initial estimate 62 min, when duration pass runs, then accessory intents are cut in defined priority order.
+- Given pain suppression on shoulder and horizontal_push slot, when substitution runs, then non-shoulder-aggravating substitute selected and load converted per rules.
+- Given last two exposures meet add-load threshold, when recommendation engine runs, then add-load recommendation produced.
+- Given thresholds partially met, when engine runs, then hold recommendation produced.
+- Given repeated misses + form breakdown, when engine runs, then reduce or deload per precedence.
+- Given pain location lower_back with hinge movement, when recommendation engine runs, then add-load/add-reps suppressed.
+- Given not_started same-day session and regenerate request without explicit replace, when regenerate executes, then original session preserved.
+- Given in_progress session and plan regenerate, when operation completes, then session remains on original plan_version_id.
+- Given statuses completed/partial/skipped/completed_outside_app, when regenerate or equipment change occurs, then historical states preserved unchanged.
+- Given unsynced local draft before first sync, when destructive op attempted, then API blocks with recover/discard requirement.
+- Given unsynced draft after partial sync, when recover called, then duplicate clientMutationIds replay as non-fatal and unresolved conflicts returned.
+- Given duplicate clientMutationId for same session, when set-logs endpoint called, then server replays prior success with same log identifiers.
+- Given stale versionToken, when mutable endpoint called, then `409 VERSION_CONFLICT` with `currentVersionToken`.
+- Given user A token attempts user B row, when endpoint called, then `403 FORBIDDEN_RESOURCE`.
+- Given same user but plan/day mismatch chain, when set log inserted, then `422 FK_OWNERSHIP_VIOLATION`.
+- Given exercise seed load, when validation test runs, then ~80 exercises exist with 6-10 options per movement intent per common equipment profile and all cue/timing fields non-null.
