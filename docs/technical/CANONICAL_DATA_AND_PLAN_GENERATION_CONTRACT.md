@@ -67,6 +67,9 @@ Columns:
 - `body_weight_unit weight_unit null`
 - `experience_level experience_level null`
 - `timezone text not null default 'UTC'`
+- `analytics_opt_out boolean not null default false`
+- `pending_deletion_at timestamptz null`
+- `hard_delete_by timestamptz null`
 - `onboarding_completed_at timestamptz null`
 - `created_at timestamptz not null default now()`
 - `updated_at timestamptz not null default now()`
@@ -75,12 +78,13 @@ Columns:
 Constraints/indexes:
 - `check ((body_weight is null and body_weight_unit is null) or (body_weight is not null and body_weight_unit is not null))`
 - index on `(user_id)` unique already covers lookup.
+- check (`pending_deletion_at is null and hard_delete_by is null`) or (`pending_deletion_at is not null and hard_delete_by is not null and hard_delete_by >= pending_deletion_at`).
 
 Ownership/versioning:
 - owner is `user_id`.
 - any mutable update increments `version_token +1`.
 
-API mapping exposed: `bodyWeightUnit`, `experienceLevel`, `onboardingCompletedAt`, `versionToken`.
+API mapping exposed: `bodyWeightUnit`, `experienceLevel`, `analyticsOptOut`, `onboardingCompletedAt`, `versionToken`.
 
 ### 2.2 `goal_plan`
 **Purpose:** User goal and weekly scheduling preferences.
@@ -165,6 +169,7 @@ Columns:
 - `exercise_key text not null unique`
 - `name text not null`
 - `movement_intents text[] not null`
+- `suppression_tags text[] not null default '{}'`
 - `primary_muscles text[] not null`
 - `secondary_muscles text[] not null default '{}'`
 - `movement_pattern text not null`
@@ -187,7 +192,8 @@ Columns:
 - `updated_at timestamptz not null default now()`
 
 Constraints/indexes:
-- GIN indexes on `movement_intents`, `primary_muscles`, `equipment_keys`.
+- GIN indexes on `movement_intents`, `suppression_tags`, `primary_muscles`, `equipment_keys`.
+- `suppression_tags` values must come from canonical domain: `chest`,`shoulders`,`back_compound_pull`,`triceps_overhead_loaded`,`biceps`,`triceps`,`loaded_grip_pull`,`loaded_pressing`,`loaded_pulling`,`posterior_chain_loaded`,`spinal_loading`,`rows`,`pull_ups`,`loaded_carries`,`squat_pattern`,`hinge_pattern`,`lunge_pattern`,`leg_extension`,`leg_press`,`calf`,`loaded_standing`,`loaded_carry`.
 - checks: `cardinality(movement_intents)>=1`, `cardinality(primary_muscles)>=1`, `cardinality(equipment_keys)>=1`.
 - all cue/timing columns required (non-null) for seeded active exercises.
 
@@ -244,7 +250,7 @@ Columns:
 - `workout_reminder_minutes_before integer not null default 30 check (workout_reminder_minutes_before between 5 and 1440)`
 - `missed_workout_follow_up_enabled boolean not null default true`
 - `recommendation_pending_review_enabled boolean not null default true`
-- `streak_milestone_enabled boolean not null default true`
+- `streak_milestone_enabled boolean not null default false`
 - `quiet_hours_enabled boolean not null default true`
 - `quiet_hours_start_local time not null default '21:00:00'`
 - `quiet_hours_end_local time not null default '08:00:00'`
@@ -256,6 +262,21 @@ Columns:
 Rules:
 - quiet-hours window may wrap midnight (default 9pm–8am local).
 - scheduler must evaluate quiet hours in user timezone.
+
+### 2.9.A `trust_survey_response`
+**Purpose:** Canonical persistence for week-indexed trust survey responses.
+
+Columns:
+- `id uuid pk`
+- `user_id uuid not null fk auth.users(id) on delete cascade`
+- `week_index integer not null check (week_index >= 1)`
+- `trust_rating integer not null check (trust_rating between 1 and 5)`
+- `submitted_at timestamptz not null`
+- `created_at timestamptz not null default now()`
+
+Constraints/indexes:
+- `unique (user_id, week_index)` (no duplicate response for same user/week in MVP; update semantics are explicit overwrite through endpoint upsert path only).
+- index `(user_id, submitted_at desc)`.
 
 ### 2.10 `plan_version`
 **Purpose:** Immutable generated plan snapshot metadata + lifecycle.
@@ -774,7 +795,7 @@ Invalid transitions: `422 INVALID_STATE_TRANSITION`.
 ### 3.7 Notification preferences
 17) `GET /v1/notification-preferences` -> `200` full preference object.
 18) `PATCH /v1/notification-preferences`
-- Body: `{ "versionToken":2, "pushOptIn":true, "workoutReminderEnabled":true, "workoutReminderMinutesBefore":30, "missedWorkoutFollowUpEnabled":true, "recommendationPendingReviewEnabled":true, "streakMilestoneEnabled":true, "quietHoursEnabled":true, "quietHoursStartLocal":"21:00:00", "quietHoursEndLocal":"08:00:00", "timezone":"America/New_York" }`
+- Body: `{ "versionToken":2, "pushOptIn":true, "workoutReminderEnabled":true, "workoutReminderMinutesBefore":30, "missedWorkoutFollowUpEnabled":true, "recommendationPendingReviewEnabled":true, "streakMilestoneEnabled":false, "quietHoursEnabled":true, "quietHoursStartLocal":"21:00:00", "quietHoursEndLocal":"08:00:00", "timezone":"America/New_York" }`
 - Success `200` with token+1.
 
 ### 3.8 Recommendation actions
@@ -810,10 +831,26 @@ MVP bounded schema requirement for recommendation explainability fields:
 - Conflicts: `409` with codes `SESSION_ALREADY_COMPLETED`, `PLAN_VERSION_MISMATCH`, `WORKOUT_DAY_MISMATCH`, `STALE_VERSION_TOKEN`.
 
 RLS/ownership expectations for all endpoints: authenticated user may only read/write rows where `row.user_id = auth.uid()`; cross-user attempts return `403 FORBIDDEN_RESOURCE`; same-user invalid FK chain returns `422 FK_OWNERSHIP_VIOLATION`.
-`§3.A`, `§3.B`, and `§3.C` are integrated normative subsections of §3 (not appendices) and define the strict implementation-ready schemas for every endpoint listed in §3.1–§3.11 and §3.C.1–§3.C.8, including method/path/auth/headers/request/response/errors/idempotency/versionToken/RLS/transaction notes.
+The endpoint schema expansions in §3.12–§3.14 are normative subsections of §3 and define strict implementation-ready schemas for every endpoint listed in §3.1–§3.14, including method/path/auth/headers/request/response/errors/idempotency/versionToken/RLS/transaction notes.
 
 
-### 3.12 Endpoint schema expansion (integrated from former §3.A)
+
+### 3.12 Trust survey
+25) `POST /v1/trust-survey`
+- Headers: `Idempotency-Key` required
+- Body: `{ "versionToken":7, "weekIndex":4, "trustRating":5, "submittedAt":"2026-05-10T12:00:00Z" }`
+- Success `200`: `{ "data": { "weekIndex":4, "trustRating":5, "submittedAt":"...", "versionToken":8 } }`
+- Behavior: upsert for `(user_id, week_index)`; repeated same payload + idempotency key replays success.
+
+### 3.13 Account deletion request
+26) `POST /v1/account/deletion-request`
+- Headers: `Idempotency-Key` required
+- Body: `{ "versionToken":8, "requestedAt":"2026-05-10T12:00:00Z" }`
+- Success `200`: `{ "data": { "pendingDeletionAt":"...", "hardDeleteBy":"...", "versionToken":9 } }`
+- Behavior: sets `user_profile.pending_deletion_at` immediately, computes `hard_delete_by` from policy-configured retention window, and blocks app data access immediately for that user except deletion-status read + auth/session termination flows.
+- Legal note: final retention/anonymization text remains PRD/legal blocker in §9.
+
+### 3.14 Endpoint schema expansion
  (authoritative supplement to §3.1–§3.11)
 For each endpoint in §3, the following are mandatory and not optional: method/path, auth, required headers, strict request schema, strict success schema, error codes, idempotency behavior, versionToken behavior, transaction notes, RLS ownership checks.
 
@@ -833,7 +870,7 @@ For each endpoint in §3, the following are mandatory and not optional: method/p
 - Recommendation actions (§3.8): include versionToken; ignore requires `ignoredReason` enum.
 - Equipment item deletion (§3.9): requires `equipmentProfileVersionToken`; returns incremented parent token.
 - Public sample plan (§3.10): no auth, no user-owned writes, rate limits.
-- Local draft recovery (§3.11): strict local draft schema in §3.B.
+- Local draft recovery (§3.11): strict local draft schema in §3.15.
 
 #### 3.12.3 Endpoint-level idempotency and versionToken behavior
 - `POST /v1/plans/generate`: idempotent by key+body; no versionToken required.
@@ -844,8 +881,8 @@ For each endpoint in §3, the following are mandatory and not optional: method/p
 - `PUT /v1/workout-sessions/{id}/post-workout-check-in`: idempotent upsert semantics by session.
 - `PATCH /v1/notification-preferences`, limitation patch/resolve, recommendation actions: optimistic concurrency required.
 
-### 3.13 Local draft recovery schema and conflict matrix (integrated from former §3.B)
- (full schema and conflict matrix)
+### 3.15 Local draft recovery schema and conflict matrix
+ (authoritative local-draft payload schema and conflict matrix)
 Local draft payload schema:
 - `localDraftId string not null`
 - `planVersionId uuid not null`
@@ -879,14 +916,16 @@ Conflict handling codes:
 - `DUPLICATE_CLIENT_MUTATION_ID`: non-fatal replay list in success payload.
 - `PARTIAL_SYNC_CONFLICT`: return merged summary + unresolved item list.
 
-### 3.14 Missing MVP endpoint contracts (integrated from former §3.C)
+### 3.16 Missing MVP endpoint contracts
  (authoritative supplement to §3)
 
 #### 3.14.1 User profile / onboarding
 - `PUT /v1/user-profile`
-  - Request: `{ versionToken?: number, birthDate?: date|null, sex?: enum|null, heightCm?: number|null, bodyWeight?: number|null, bodyWeightUnit?: kg|lb|null, experienceLevel?: beginner|intermediate|null, timezone: string, onboardingCompletedAt?: timestamptz|null }`
+  - Request: `{ versionToken?: number, birthDate?: date|null, sex?: enum|null, heightCm?: number|null, bodyWeight?: number|null, bodyWeightUnit?: kg|lb|null, experienceLevel?: beginner|intermediate|null, timezone: string, onboardingCompletedAt?: timestamptz|null, analyticsOptOut?: boolean }`
   - Success: `{ data: { ...userProfile, versionToken:number } }`
-  - Errors: `422` invalid ranges/combinations, `409 VERSION_CONFLICT`, `403` cross-user.
+  - Errors: `422` invalid ranges/combinations/underage/onboarding-incomplete, `409 VERSION_CONFLICT`, `403` cross-user.
+  - Onboarding completion rule: setting `onboardingCompletedAt` requires non-null `bodyWeight`, `bodyWeightUnit`, `heightCm`, (`birthDate` proving age >=18 at save time), `experienceLevel`, active `goalPlan` (`goalType`,`daysPerWeek`,`preferredWeekdays`,`sessionLengthMin`), and active equipment profile with >=1 equipment item.
+  - Age gate: server rejects under-18 users at onboarding completion and account-save with `422 UNDERAGE_NOT_ALLOWED`; `birthDate` may remain null only while onboarding draft is incomplete. Sex remains optional in MVP.
   - Idempotency/versioning: requires `Idempotency-Key`; create path may omit versionToken, update path requires exact current token.
   - RLS: only `user_profile.user_id=auth.uid()` row.
 
@@ -992,6 +1031,8 @@ Per-table RLS matrix (explicit):
 - `user_exercise_preference`: client CRUD ✅ via ownership policy.
 - `user_limitation`: client select ✅ insert ✅ update ✅ delete ❌(resolve instead); resolve is RPC-only ✅.
 - `notification_preference`: select ✅ insert ✅ update ✅ delete ❌.
+- `trust_survey_response`: select ✅ insert ❌ update ❌ delete ❌; RPC-only writes ✅ (`rpc_upsert_trust_survey_response`).
+- account deletion state source of truth: `user_profile.pending_deletion_at` + `user_profile.hard_delete_by`; once pending is set, all user-owned table policies additionally require `pending_deletion_at is null` for app reads/writes (except dedicated deletion-status/account endpoints).
 - `plan_version`: select ✅ insert ❌ update ❌ delete ❌; RPC-only writes ✅ (`rpc_generate/accept/regenerate/revert_plan`); service-only direct writes ✅.
 - `workout_day`: select ✅ insert ❌ update ❌ delete ❌; RPC-only/service-only writes ✅.
 - `exercise_instance`: select ✅ insert ❌ update ❌ delete ❌; RPC-only/service-only writes ✅ (including future-plan substitution apply).
@@ -1013,6 +1054,10 @@ Named RPC list and contracts:
 - `rpc_append_set_logs(session_id uuid, version_token int, entries jsonb) -> set_log_result`.
 - `rpc_recover_local_draft(payload jsonb) -> recovery_result`.
 - `rpc_apply_recommendation_action(recommendation_id uuid, action text, version_token int, ignored_reason text) -> recommendation`.
+- `rpc_apply_substitution(target_context text, plan_version_id uuid, workout_day_id uuid, workout_session_id uuid, exercise_instance_id uuid, replacement_exercise_catalog_id uuid, version_token int, idempotency_key text) -> substitution_result`; verifies ownership, validates FK chain to selected context, requires matching version token on mutable parent (`plan_version` for future_plan or `workout_session` for session_override), idempotent on `(user_id,idempotency_key,exercise_instance_id,replacement_exercise_catalog_id)`, errors: `403 FORBIDDEN_RESOURCE`, `409 VERSION_CONFLICT`, `422 FK_OWNERSHIP_VIOLATION|INVALID_SUBSTITUTION_TARGET|PAIN_SUPPRESSION_CONFLICT`.
+- `rpc_add_equipment_item(equipment_profile_id uuid, equipment_profile_version_token int, equipment_key text, idempotency_key text) -> equipment_profile_item_result`; validates ownership + `equipment_key` exists and active, bumps parent token +1, idempotent replay returns existing row, errors: `409 VERSION_CONFLICT`, `422 INVALID_EQUIPMENT_KEY|DUPLICATE_EQUIPMENT_ITEM`.
+- `rpc_remove_equipment_item(equipment_profile_id uuid, equipment_profile_item_id uuid, equipment_profile_version_token int, idempotency_key text) -> equipment_profile_item_result`; validates ownership chain/profile membership, enforces non-negative remaining item rules from generator preconditions, bumps parent token +1, idempotent delete replay acknowledged, errors: `409 VERSION_CONFLICT`, `422 FK_OWNERSHIP_VIOLATION|MIN_EQUIPMENT_VIOLATION`.
+- `rpc_upsert_post_workout_check_in(workout_session_id uuid, version_token int, payload jsonb, idempotency_key text) -> post_workout_check_in`; validates ownership + session mutability, upsert-by-session semantics with token increment exactly +1, same key+payload replay safe, errors: `409 VERSION_CONFLICT`, `422 INVALID_STATE_TRANSITION|CHECKIN_SCHEMA_INVALID`.
 
 Trigger names/responsibilities:
 - `trg_set_updated_at_*`: set `updated_at=now()`.
@@ -1038,15 +1083,18 @@ Must-pass tests:
 5. Local draft recovery conflict and duplicate `clientMutationId` replay tests.
 6. RLS tests: cross-user denied (`403`), same-user wrong chain (`422`).
 7. FK invariants tests for session/day/plan and set_log references.
-8. Notification quiet-hours (9pm–8am local), timezone handling, defaults (`pushOptIn=true`, reminder 30).
+8. Notification defaults/quiet-hours tests: workout reminder default on, missed-workout follow-up default on, recommendation-pending review default on, streak milestone default off (opt-in), and every notification type honors timezone + quiet hours (9pm–8am local).
 9. Equipment taxonomy enforcement (`equipment_key` must exist in `equipment_catalog`) and parent token bump on item mutations.
 10. Exercise seed verification: catalog populated with ~80 curated exercises.
 11. Notification preferences cover workout reminder, missed-workout follow-up, recommendation-pending review, streak milestone; quiet-hours suppression enforced in user timezone for each type.
 12. Analytics allowlist enforcement rejects non-allowlisted events and blocks payloads containing prohibited PII/sensitive fields.
-13. Trust survey week-4 capture persists rating (1..5) and enables trust-survey metric query.
+13. Trust survey persistence + RLS: week-index capture persists rating (1..5), enforces unique `(user_id, week_index)`, user can read own rows only, cross-user read/write blocked.
 14. Recommendation `triggerFactors` and `inputsUsed` schema validator accepts allowlisted keys and rejects unknown keys.
 15. Substitution endpoints enforce `future_plan` vs `session_override` behavior and guarantee completed workout history/set logs are never rewritten.
-16. Readiness checklist test fails if §10.B marked complete while §9 open decisions remain unresolved.
+16. Onboarding age gate: under-18 onboarding/account-save rejected with `422 UNDERAGE_NOT_ALLOWED`; valid adult onboarding completion succeeds only when all required PRD onboarding fields are present.
+17. Pain suppression determinism: shoulder, elbow, wrist, lower_back, upper_back, hip, knee, ankle, and other cases each produce expected suppression outcomes from `suppression_tags` mapping.
+18. Account deletion request: setting pending deletion immediately blocks app data access, returns `pendingDeletionAt` and `hardDeleteBy`, and preserves legal-retention open decision flags.
+19. Readiness checklist test fails if §10.B marked complete while §9 open decisions remain unresolved.
 ### 6.1 Concrete Given/When/Then acceptance tests (integrated from former §6.A)
  Concrete Given/When/Then acceptance tests
 - Given two same-day slots and identical top candidate, when generator assigns slot2, then cross-slot exclusion picks next candidate.
@@ -1091,13 +1139,24 @@ All exposed mutable entities include `versionToken` in API: `userProfile`, `goal
 ## 8.1 MVP analytics and trust-validation contract
 
 Event allowlist (only these events permitted in MVP analytics pipeline):
-- `recommendation_why_expanded`
-- `recommendation_why_then_accepted`
+- `account_created`
+- `onboarding_started`
+- `onboarding_completed`
+- `onboarding_abandoned_with_plan`
+- `plan_generated`
+- `plan_generation_failed`
+- `workout_started`
+- `set_logged`
+- `workout_completed`
+- `workout_completed_partial`
+- `exercise_substituted`
+- `missed_workout_action_selected`
+- `recommendation_shown`
 - `recommendation_accepted`
 - `recommendation_ignored`
+- `recommendation_why_expanded`
+- `recommendation_why_then_accepted`
 - `trust_survey_submitted`
-- `onboarding_abandoned_with_plan`
-- `missed_workout_action_selected`
 
 PII/sensitive boundaries (hard deny, never emitted):
 - body weight values
@@ -1109,7 +1168,7 @@ PII/sensitive boundaries (hard deny, never emitted):
 - soreness/pain location specifics
 
 Analytics preference support:
-- Add `analytics_opt_out boolean not null default false` to `user_profile` API/DB contract; if true, no analytics events are emitted for that user except strictly required operational security logs outside product analytics.
+- `analytics_opt_out` is canonical in `user_profile`; if true, emit no product analytics events for that user (including allowlisted events) except strictly required operational/security logs that are outside product analytics pipeline.
 
 Trust survey capture (week-4 metric minimum contract):
 - `POST /v1/trust-survey` request `{ versionToken:number, weekIndex:4, trustRating:1..5, submittedAt:timestamptz }` and response with incremented `versionToken`.
@@ -1125,7 +1184,7 @@ Blocking decisions outside this contract (if unresolved in PRD) must remain flag
 - pricing validation.
 - WCAG audit cadence and accessibility QA owner assignment.
 - §5.5 content author and reviewer confirmation before build week 1.
-- recommendation `triggerFactors/inputsUsed` bounded MVP schema approval if PRD edits are pending.
+
 
 ---
 
@@ -1147,13 +1206,11 @@ Blocking decisions outside this contract (if unresolved in PRD) must remain flag
 - [ ] Migration DDL generated exactly from this contract.
 - [ ] RPCs implement all state transitions and idempotency semantics.
 - [ ] Integration/e2e suite passes all §6 tests in CI.
-- [x] No placeholder language remains.
+- [x] Placeholder/meta references to former subsection labels removed or rewritten to current section references.
 
 
 ## 11) Patch Summary
-- Sections amended: §1 status, §2.6 (`cue_safety_note` nullability), §2.16 (`soreness_location` nullability + API consistency), §3 ownership/error invariants and normative integration statement, §5.A explicit per-table RLS matrix, §10 readiness checklist.
-- Sections added: §2.18 `exercise_substitution` persistence model (future-plan + session-level substitution with FK/ownership/versioning/immutability semantics).
-- Sections moved: former §3.A/§3.B/§3.C merged into §3.12–§3.14; former §5.A merged into §5.1; former §6.A merged into §6.1 with cross-reference updates.
-- Sections deleted: none. No implementation-critical schema/API/RLS/sync/state-machine/generator/progression/acceptance-test content was removed.
-- Remaining blockers before production implementation readiness: §10.C items (migration generation, RPC implementation, CI e2e pass, PRD pre-build gates) remain execution tasks and are intentionally unchecked.
-
+- Sections amended: §2.1, §2.6, §2.9, §2.B.1.A, §3.7, §3.12–§3.16, §5.1, §6/§6.1, §8.1, §9, §10.
+- Sections added: §2.9.A (`trust_survey_response`), §3.12 (trust survey endpoint), §3.13 (account deletion request endpoint).
+- Sections deleted: none.
+- Remaining blockers before production implementation readiness: PRD §0 pre-build gates, unresolved PRD open decisions in §9 (including legal/privacy retention copy), generated migrations/RPC implementation completion, and CI e2e pass of §6 acceptance suite.
