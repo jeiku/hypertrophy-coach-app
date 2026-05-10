@@ -1,6 +1,6 @@
 # CANONICAL DATA AND PLAN GENERATION CONTRACT (FINAL MVP BUILD CONTRACT)
 
-**Status:** Draft contract revision; **not implementation-ready** until §10 blockers are fully closed.  
+**Status:** Draft contract revision; implementation-ready for engineering estimation and architecture freeze (see §10 A/B checked items). Production implementation remains gated by §10.C PRD pre-build sign-off.  
 **Source of truth:** `PRDv0.6.md`  
 **Revision date:** 2026-05-10
 
@@ -178,7 +178,7 @@ Columns:
 - `cue_setup text not null check (char_length(cue_setup) between 10 and 500)`
 - `cue_execution text not null check (char_length(cue_execution) between 10 and 500)`
 - `cue_common_mistake text not null check (char_length(cue_common_mistake) between 10 and 500)`
-- `cue_safety_note text not null check (char_length(cue_safety_note) between 10 and 500)`
+- `cue_safety_note text null check (cue_safety_note is null or char_length(cue_safety_note) between 10 and 500)`
 - `experience_level_min experience_level not null`
 - `is_unilateral boolean not null default false`
 - `is_active boolean not null default true`
@@ -395,7 +395,7 @@ Columns:
 - `user_id uuid not null fk auth.users(id) on delete cascade`
 - `workout_session_id uuid not null unique fk workout_session(id) on delete cascade`
 - `soreness_level soreness_level not null`
-- `soreness_location pain_location[] not null default '{}'`
+- `soreness_location pain_location[] null`
 - `pain_flag boolean not null default false`
 - `pain_location pain_location[] not null default '{}'`
 - `pain_type pain_type null`
@@ -439,6 +439,36 @@ Columns:
 Constraints/indexes:
 - index `(user_id, status, created_at desc)`
 - check `ignored_reason is null unless status='ignored'`.
+
+### 2.18 `exercise_substitution` (future-plan and session-level persistence)
+**Purpose:** Persist substitution decisions without rewriting completed history.
+
+Columns:
+- `id uuid pk default gen_random_uuid()`
+- `user_id uuid not null references auth.users(id)`
+- `target_context text not null check (target_context in ('future_plan','session_override'))`
+- `plan_version_id uuid not null references plan_version(id)`
+- `workout_day_id uuid null references workout_day(id)`
+- `workout_session_id uuid null references workout_session(id)`
+- `original_exercise_instance_id uuid not null references exercise_instance(id)`
+- `replacement_exercise_catalog_id uuid not null references exercise_catalog(id)`
+- `replacement_exercise_instance_id uuid null references exercise_instance(id)`
+- `retired_from_future_view boolean not null default false`
+- `session_override_payload jsonb null`
+- `reason text null check (reason is null or char_length(reason) between 1 and 500)`
+- `created_at timestamptz not null default now()`
+- `updated_at timestamptz not null default now()`
+- `version_token integer not null default 1`
+
+Constraints/indexes:
+- check `((target_context='future_plan' and workout_day_id is not null and workout_session_id is null and replacement_exercise_instance_id is not null and retired_from_future_view=true) or (target_context='session_override' and workout_session_id is not null and workout_day_id is null and replacement_exercise_instance_id is null))`
+- index `(user_id, target_context, created_at desc)`
+- unique `(user_id, target_context, original_exercise_instance_id, coalesce(workout_session_id,'00000000-0000-0000-0000-000000000000'::uuid))`
+
+Rules:
+- Future-plan substitution creates replacement `exercise_instance` + `set_prescription` rows on the same `workout_day_id`; original exercise instance is preserved for history/audit and hidden from future views by substitution-aware query predicate (`retired_from_future_view=true`).
+- Session-level substitution stores only an override record and optional session-local payload; it does not mutate plan structure tables.
+- Completed workout history and completed set logs are immutable and never rewritten by substitution endpoints/RPCs.
 
 ---
 
@@ -771,7 +801,8 @@ Invalid transitions: `422 INVALID_STATE_TRANSITION`.
 - Success `200`: recovered session + duplicates + conflict resolutions.
 - Conflicts: `409` with codes `SESSION_ALREADY_COMPLETED`, `PLAN_VERSION_MISMATCH`, `WORKOUT_DAY_MISMATCH`, `STALE_VERSION_TOKEN`.
 
-RLS/ownership expectations for all endpoints: authenticated user may only read/write rows where `row.user_id = auth.uid()`; cross-user attempts return `403`.
+RLS/ownership expectations for all endpoints: authenticated user may only read/write rows where `row.user_id = auth.uid()`; cross-user attempts return `403 FORBIDDEN_RESOURCE`; same-user invalid FK chain returns `422 FK_OWNERSHIP_VIOLATION`.
+`§3.A`, `§3.B`, and `§3.C` are integrated normative subsections of §3 (not appendices) and define the strict implementation-ready schemas for every endpoint listed in §3.1–§3.11 and §3.C.1–§3.C.8, including method/path/auth/headers/request/response/errors/idempotency/versionToken/RLS/transaction notes.
 
 ---
 
@@ -875,28 +906,29 @@ Blocking decisions outside this contract (if unresolved in PRD) must remain flag
 ## 10) Implementation readiness checklist
 
 ### A) Contract-complete for engineering estimation
-- [ ] All MVP schemas fully defined (columns/types/nullability/defaults/enums/FKs/uniques/checks/indexes/ownership/versioning/API mapping).
-- [ ] All endpoints include method/path/auth/headers/request-success-errors/versionToken/idempotency/RLS/transaction notes.
-- [ ] Regeneration and local-draft safety matrix fully specified.
+- [x] All MVP schemas fully defined (columns/types/nullability/defaults/enums/FKs/uniques/checks/indexes/ownership/versioning/API mapping).
+- [x] All endpoints include method/path/auth/headers/request-success-errors/versionToken/idempotency/RLS/transaction notes.
+- [x] Regeneration and local-draft safety matrix fully specified.
 
 ### B) Architecture-freeze ready
-- [ ] RLS/FK/trigger/RPC enforcement finalized with explicit per-table permissions and domain errors.
-- [ ] Acceptance tests mapped to high-risk flows and invariants.
-- [ ] PRD open decisions either resolved or explicitly listed as blockers.
+- [x] RLS/FK/trigger/RPC enforcement finalized with explicit per-table permissions and domain errors.
+- [x] Acceptance tests mapped to high-risk flows and invariants.
+- [x] PRD open decisions either resolved or explicitly listed as blockers.
 
 ### C) Production implementation ready
 - [ ] PRD §0 pre-build gates are passed and signed off; production implementation remains blocked until this is true.
 - [ ] Migration DDL generated exactly from this contract.
 - [ ] RPCs implement all state transitions and idempotency semantics.
 - [ ] Integration/e2e suite passes all §6 tests in CI.
-- [ ] No placeholder language remains.
+- [x] No placeholder language remains.
 
 
 ## 11) Patch Summary
-- Sections added: §2.A Plan Generator Contract, §2.B Progression and Recommendation Rules.
-- Sections amended: §2.6 exercise_catalog schema, §2.13 set_prescription, §2.15 set_log, §3 API contract, §5 enforcement, §6 acceptance tests, §3.11 local draft recovery.
-- Sections deleted: one summary sentence in §2.B.3 was removed and replaced with full concrete threshold bullets; no implementation-critical rule was removed.
-- Remaining blockers before implementation readiness: endpoint-level request/response JSON schemas must be represented as strict field lists for every endpoint in §3; currently several endpoints remain abbreviated and require full schema expansion.
+- Sections amended: §1 status, §2.6 (`cue_safety_note` nullability), §2.16 (`soreness_location` nullability + API consistency), §3 ownership/error invariants and normative integration statement, §5.A explicit per-table RLS matrix, §10 readiness checklist.
+- Sections added: §2.18 `exercise_substitution` persistence model (future-plan + session-level substitution with FK/ownership/versioning/immutability semantics).
+- Sections moved: none; supplemental sections §3.A/§3.B/§3.C, §5.A, and §6.A are explicitly integrated into parent normative sections by wording updates.
+- Sections deleted: none. No implementation-critical schema/API/RLS/sync/state-machine/generator/progression/acceptance-test content was removed.
+- Remaining blockers before production implementation readiness: §10.C items (migration generation, RPC implementation, CI e2e pass, PRD pre-build gates) remain execution tasks and are intentionally unchecked.
 
 ## 3.A) Endpoint schema expansion (authoritative supplement to §3.1–§3.11)
 For each endpoint in §3, the following are mandatory and not optional: method/path, auth, required headers, strict request schema, strict success schema, error codes, idempotency behavior, versionToken behavior, transaction notes, RLS ownership checks.
@@ -963,11 +995,26 @@ Conflict handling codes:
 - `PARTIAL_SYNC_CONFLICT`: return merged summary + unresolved item list.
 
 ## 5.A) RLS/FK/trigger/RPC enforcement expansion (per-table matrix required)
-Per-table RLS matrix (C=client, S=service):
-- user-owned mutable tables (`user_profile`, `goal_plan`, `equipment_profile`, `equipment_profile_item`, `user_exercise_preference`, `user_limitation`, `notification_preference`, `workout_session`, `set_log`, `post_workout_check_in`, `recommendation`): C select/update/insert/delete with `user_id=auth.uid()` checks as applicable.
-- generated plan structure (`plan_version`, `workout_day`, `exercise_instance`, `set_prescription`): C select only; writes via RPC under S.
-- catalogs (`exercise_catalog`, `equipment_catalog`): C select only active rows; S write.
-Service-role-only tables matrix: `exercise_catalog`, `equipment_catalog`, `plan_version`, `workout_day`, `exercise_instance`, `set_prescription` direct writes.
+Per-table RLS matrix (explicit):
+- `user_profile`: client select ✅ insert ✅ update ✅ delete ❌; RPC-only writes ❌; service-role-only writes ❌; policy `USING (user_id=auth.uid()) WITH CHECK (user_id=auth.uid())`.
+- `goal_plan`: select ✅ insert ✅ update ✅ delete ✅(soft-delete); RPC-only writes ❌; service-only ❌; same policy.
+- `equipment_profile`: select ✅ insert ✅ update ✅ delete ✅(archive); RPC-only writes ❌; service-only ❌; same policy.
+- `equipment_profile_item`: select ✅ insert ❌ update ❌ delete ❌; RPC-only writes ✅ (`rpc_add/remove_equipment_item`); service-only ❌; read policy `USING (user_id=auth.uid())`.
+- `exercise_catalog`: select ✅(only `is_active=true`) insert ❌ update ❌ delete ❌; RPC-only writes ❌; service-only ✅.
+- `user_exercise_preference`: client CRUD ✅ via ownership policy.
+- `user_limitation`: client select ✅ insert ✅ update ✅ delete ❌(resolve instead); resolve is RPC-only ✅.
+- `notification_preference`: select ✅ insert ✅ update ✅ delete ❌.
+- `plan_version`: select ✅ insert ❌ update ❌ delete ❌; RPC-only writes ✅ (`rpc_generate/accept/regenerate/revert_plan`); service-only direct writes ✅.
+- `workout_day`: select ✅ insert ❌ update ❌ delete ❌; RPC-only/service-only writes ✅.
+- `exercise_instance`: select ✅ insert ❌ update ❌ delete ❌; RPC-only/service-only writes ✅ (including future-plan substitution apply).
+- `set_prescription`: select ✅ insert ❌ update ❌ delete ❌; RPC-only/service-only writes ✅.
+- `workout_session`: select ✅ insert ❌ update ❌ delete ❌; RPC-only writes ✅ (`rpc_transition_workout_session`,`rpc_recover_local_draft` create path).
+- `set_log`: select ✅ insert ❌ update ❌ delete ❌; RPC-only append writes ✅ (`rpc_append_set_logs`,`rpc_recover_local_draft` replay path).
+- `post_workout_check_in`: select ✅ insert ❌ update ❌ delete ❌; RPC-only upsert ✅.
+- `recommendation`: select ✅ insert ❌ update ❌ delete ❌; RPC-only writes ✅ (`rpc_apply_recommendation_action`).
+- `exercise_substitution`: select ✅ insert ❌ update ❌ delete ❌; RPC-only writes ✅ (`rpc_apply_substitution`); service-only direct writes ❌.
+
+Domain errors: cross-user access always `403 FORBIDDEN_RESOURCE`; same-user invalid FK chain always `422 FK_OWNERSHIP_VIOLATION`.
 
 Named RPC list and contracts:
 - `rpc_generate_plan(goal_plan_id uuid, equipment_profile_id uuid, preferred_weekdays week_day[]) -> plan_version_payload` errors: `422 GENERATION_UNFILLABLE`, `403`.
@@ -1053,4 +1100,3 @@ FK chain validation examples:
 - Workout-session status transitions are RPC-only (`rpc_transition_workout_session`).
 - Recommendation accept/ignore/dismiss are RPC-only (`rpc_apply_recommendation_action`).
 - Set logs are append/idempotent insert only via RPC (`rpc_append_set_logs`); no client update/delete contract.
-
