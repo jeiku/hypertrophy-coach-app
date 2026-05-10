@@ -294,6 +294,7 @@ Columns:
 - `equipment_profile_id uuid not null fk equipment_profile(id)`
 - `status plan_version_status not null default 'draft'`
 - `generation_reason text not null` (`initial|regenerate|recovery|revert_clone` values via check)
+- `generation_trigger text null` (`manual_regenerate|equipment_change|missed_workout_recovery|schedule_change|focus_change|other` values via check; optional specificity for generation/regeneration trigger)
 - `source_plan_version_id uuid null fk plan_version(id)`
 - `validation_warnings_json jsonb not null default '[]'::jsonb`
 - `accepted_at timestamptz null`
@@ -303,12 +304,14 @@ Columns:
 - `version_token integer not null default 1`
 
 Constraints/indexes:
-- one active plan version per user: partial unique `(user_id) where status='active'`
+- one current active-like plan version per user: partial unique `(user_id) where status in ('active','reverted')`
 - index `(user_id, status, created_at desc)`
+- active plan lookup semantics MUST include statuses `active` and `reverted`.
 
 Behavior:
 - workouts tied to a plan version remain tied permanently.
 - regeneration creates new row; no mutation of historical planned workout structure.
+- a reverted plan (`status='reverted'`) is treated as the user's current active plan and MUST be created from `source_plan_version_id`.
 
 ### 2.11 `workout_day`
 **Purpose:** Planned days inside a plan version.
@@ -554,48 +557,47 @@ PRD slot taxonomy mapping (non-lossy; authoritative for generator/output APIs):
 
 Contract rule: every internal `movementIntent` value MUST map to exactly one PRD slot taxonomy row above, and every emitted slot/reason object must include both `movementIntent` and `prdSlotTaxonomy` fields.
 
-### 2.A.2 Split templates by days/week (PRD-exact)
-- 2 days/week: Full Body A/B.
-  - Day A slots: `knee_dominant_squat`,`horizontal_push`,`horizontal_pull`,`hip_hinge`,`vertical_push`,`core_anti_extension`,`arm_elbow_flexion`.
-  - Day B slots: `single_leg`,`vertical_pull`,`horizontal_push`,`hip_hinge`,`lateral_deltoid`,`arm_elbow_extension`,`calf_plantarflexion`.
-- 3 days/week: Full Body A/B/C.
-  - Day A: `knee_dominant_squat`,`horizontal_push`,`horizontal_pull`,`hip_hinge`,`core_anti_extension`,`arm_elbow_flexion`.
-  - Day B: `single_leg`,`vertical_push`,`vertical_pull`,`hip_hinge`,`rear_deltoid`,`arm_elbow_extension`,`calf_plantarflexion`.
-  - Day C: `knee_dominant_squat`,`horizontal_pull`,`horizontal_push`,`single_leg`,`core_anti_rotation`,`lateral_deltoid`.
-- 4 days/week: Upper/Lower.
-  - Upper A: `horizontal_push`,`horizontal_pull`,`vertical_push`,`vertical_pull`,`lateral_deltoid`,`arm_elbow_flexion`,`arm_elbow_extension`.
-  - Lower A: `knee_dominant_squat`,`hip_hinge`,`single_leg`,`calf_plantarflexion`,`core_anti_extension`.
-  - Upper B: `vertical_push`,`vertical_pull`,`horizontal_push`,`horizontal_pull`,`rear_deltoid`,`arm_elbow_flexion`,`arm_elbow_extension`.
-  - Lower B: `hip_hinge`,`knee_dominant_squat`,`single_leg`,`calf_plantarflexion`,`core_anti_rotation`.
-- 5 days/week: Upper/Lower + 1 focus day.
-  - Upper A, Lower A, Upper B, Lower B as above.
-  - Focus day: exactly 6 slots and at least 3 slots must target `focus_muscles`-aligned intents from (`horizontal_push`,`vertical_push`,`horizontal_pull`,`vertical_pull`,`arm_elbow_flexion`,`arm_elbow_extension`,`lateral_deltoid`,`rear_deltoid`,`calf_plantarflexion`,`core_anti_extension`,`core_anti_rotation`).
-- 6 days/week, beginner: Full Body x6 with conservative volume.
-  - A/B/C repeated twice; max 6 slots per day; no day may include both `knee_dominant_squat` and `hip_hinge` with fatigue_cost >=4.
-- 6 days/week, intermediate: PPL x2.
-  - Push day: `horizontal_push`,`vertical_push`,`arm_elbow_extension`,`lateral_deltoid`,`core_anti_extension`.
-  - Pull day: `horizontal_pull`,`vertical_pull`,`arm_elbow_flexion`,`rear_deltoid`,`core_anti_rotation`.
-  - Legs day: `knee_dominant_squat`,`hip_hinge`,`single_leg`,`calf_plantarflexion`.
+### 2.A.2 Split templates by days/week (PRD rules + deterministic implementation expansion of PRD)
+- 2 days/week: Full Body A/B (PRD-exact slot count and composition).
+  - Each session has exactly 6 slots: `knee_dominant_squat`,`hip_hinge`,`horizontal_push`,`horizontal_pull`,(`vertical_push` OR `vertical_pull`), and exactly 1 isolation slot.
+  - Deterministic implementation expansion of PRD: Day A uses `vertical_push`; Day B uses `vertical_pull`.
+- 3 days/week: Full Body A/B/C (PRD-exact structure; deterministic weekly rotation).
+  - Each session preserves the same 6-slot full-body structure as 2-day (`knee_dominant_squat`,`hip_hinge`,`horizontal_push`,`horizontal_pull`, one vertical pattern, one isolation).
+  - Deterministic implementation expansion of PRD: rotate which vertical pattern leads and which knee-dominant pattern variation leads across A/B/C while preserving the same slot counts.
+- 4 days/week: Upper/Lower (PRD-exact slot count and composition).
+  - Upper day: `horizontal_push`,`vertical_push`,`horizontal_pull`,`vertical_pull`, plus exactly 2 isolation slots.
+  - Lower day: `knee_dominant_squat`,`hip_hinge`,`single_leg`, plus exactly 1 isolation slot.
+- 5 days/week: Upper/Lower + focus day (PRD-exact).
+  - Days 1-4 use the exact 4-day Upper/Lower structure above.
+  - Day 5 focus day has exactly 4 slots: exactly 1 compound slot + exactly 3 isolation slots aligned to stated `focus_muscles`.
+- 6 days/week, beginner: Full Body A/B/C repeated twice with reduced per-session volume (PRD-exact high-level rule).
+  - Deterministic implementation expansion of PRD is allowed only if each session preserves the Full Body slot structure and does not inflate PRD slot counts/volume.
+- 6 days/week, intermediate: PPL x2 (PRD-exact high-level rule).
+  - Deterministic implementation expansion of PRD for Push/Pull/Legs day-by-day slot assignment is allowed only if it preserves PRD movement coverage and does not inflate PRD slot counts/volume.
 Deterministic template resolution keys: `(daysPerWeek, experienceLevel)`.
 MVP `goalType` is recorded-only metadata and MUST NOT affect template choice, slot counts, volume targets, exercise selection, progression, or recommendation decisions.
-
-### 2.A.3 Initial weekly volume targets (PRD muscle-by-muscle tables)
-Generator SHALL use the PRD v0.6 explicit beginner/intermediate muscle-by-muscle weekly set ranges (no major/minor substitution).
-Canonical constants (sets/week):
-- beginner: chest 8-12, back 10-14, quads 8-12, hamstrings 6-10, glutes 6-10, shoulders 6-10, biceps 4-8, triceps 4-8, calves 4-8, core 4-8.
-- intermediate: chest 10-16, back 12-18, quads 10-16, hamstrings 8-14, glutes 8-14, shoulders 8-14, biceps 6-10, triceps 6-10, calves 6-10, core 6-10.
+### 2.A.3 Initial weekly volume targets (PRD-exact muscle-by-muscle tables)
+Generator SHALL use the PRD v0.6 explicit beginner/intermediate muscle-by-muscle weekly set ranges.
+Canonical constants (direct sets/week):
+- beginner: chest 4-8, back 6-10, quads 4-8, hamstrings/glutes 4-8, shoulders 4-8, biceps 4-8, triceps 4-8, calves/core 0-6 (optional).
+- intermediate: chest 8-14, back 10-16, quads 8-14, hamstrings/glutes 8-14, shoulders 8-14, biceps 6-12, triceps 6-12, calves/core 4-10 (optional).
 - no history -> initialize at low end of PRD range.
 - generator target -> midpoint of PRD range.
 - progression volume increases are gated: minimum 14 consecutive days of adherence consistency and no high-soreness paired signal and no pain flag.
-Any stored copy of ranges in code/data must remain field-equivalent to PRD tables.
-
+If implementation stores hamstrings and glutes separately, or calves and core separately, that storage is an internal mapping only and MUST preserve the combined PRD range above without increasing required volume.
 ### 2.A.4 Duration estimation and accessory-cut priority (PRD-exact)
 Core duration estimate per session uses exercise-specific values:
 `sum_over_exercises(sum_over_sets(target_reps * tempo_seconds + rest_seconds) + warmup_overhead + setup_overhead)`.
 No fixed global `avgRepSeconds` constant is permitted as the core estimation rule.
 Threshold: run cut policy when estimated duration `> target_session_minutes * 1.15`.
-Accessory-cut priority order: `core_anti_extension/core_anti_rotation` -> `arm_elbow_flexion` -> `arm_elbow_extension` -> `lateral_deltoid/rear_deltoid` -> `calf_plantarflexion` -> compound non-focus slot last. Set-count floors before slot drop: compounds >=2 sets, accessories >=1 set, focus-muscle slots >=2 sets. Focus-muscle protection: if a slot maps to a focus muscle, it cannot be cut until all non-focus accessory slots have reached floor.
-
+Accessory-cut priority order:
+1) Tertiary isolations, specifically calf/forearm-style optional isolation work.
+2) Duplicate movement intents within a session.
+3) Reduce isolation set counts from 3 to 2 (floor 2).
+4) Reduce compound-accessory set counts from 4 to 3 (floor 3 for accessory compounds; primary compounds floor 3 always).
+5) Emit validation warning: `Session length target may be too short — consider 10 more minutes or fewer training days.`
+Focus-muscle protection (PRD-exact): isolation sets matching the user's focus muscle skip step 1 and are demoted to step 3 only.
+Never cut the primary compound for a slot.
 ### 2.A.5 Hard disqualifiers
 Candidate exercise is ineligible if any true:
 - inactive in `exercise_catalog`.
@@ -606,7 +608,7 @@ Candidate exercise is ineligible if any true:
 `disliked` is NOT a hard disqualifier; it remains a scoring penalty in §2.A.6 and may be relaxed only via §2.A.7 fallback.
 Experience-level filter (`experience_level_min`) applies only when at least one alternative eligible candidate exists for the slot; if no alternative exists, this filter must be relaxable in unfillable-slot fallback before slot-drop.
 
-### 2.A.6 Selection rule precedence, scoring weights, tie-breakers (PRD-exact)
+### 2.A.6 Selection rule precedence, scoring weights, tie-breakers (PRD-exact rule precedence + tie-breakers)
 Scoring components:
 - Movement-intent match `+40`
 - Same primary muscle `+25`
@@ -618,19 +620,37 @@ Scoring components:
 - High fatigue cost on back-to-back day `-10`
 - Recently skipped 3+ times `-20`
 - User disliked `-30`
-Tie-breakers: MUST follow explicit precedence order: safety/pain -> equipment -> locked user choice -> schedule/session length -> movement coverage -> experience-level volume cap -> disliked -> focus muscles -> preferred -> variety.
-
-### 2.A.7 Cross-slot exclusion, variety enforcement, unfillable-slot fallback (PRD-exact)
+Rule precedence (PRD-exact):
+1. safety/pain
+2. equipment availability
+3. locked user choice
+4. schedule/session length
+5. movement coverage
+6. experience-level volume cap
+7. disliked
+8. focus muscles
+9. preferred
+10. variety
+Tie-breakers (PRD-exact, applied only after precedence/scoring leaves a tie):
+1. lower setup complexity
+2. more beginner-friendly
+3. better prior adherence
+4. lower fatigue cost
+5. stable variety / avoid weekly novelty
+### 2.A.7 Cross-slot exclusion, variety enforcement, unfillable-slot fallback (PRD-exact + additional safety guard)
 Cross-slot exclusion in same day:
 - cannot assign same `exercise_catalog_id` to >1 slot.
-- cannot assign two hinge-intent heavy spinal-loading lifts if both fatigue_cost >=4.
+Weekly primary-compound exclusion (PRD-exact):
+- across a week, the same primary compound cannot appear in more than two slots total.
+- if top-ranked exercise is excluded by this weekly primary-compound rule, assign the next-highest-ranked eligible exercise.
+Additional safety guard (does not replace PRD weekly primary-compound exclusion):
+- cannot assign two hinge-intent heavy spinal-loading lifts if both fatigue_cost >=4 on same day.
 Variety rule: across A/B sessions in the same week, at least one exercise per movement intent must differ. If A/B days are identical for any movement intent, rerun selection for that intent using the second-highest-ranked exercise for the most-overused intent.
 Unfillable fallback order when max score `< 0` after filters/exclusions:
 1) ignore disliked penalty.
 2) ignore preferred boost.
 3) if still `< 0` or pool empty: drop slot and emit validation warning.
 Nearest-intent substitution and slot rewrite are NOT allowed in this fallback path unless PRD explicitly permits for that slot class.
-
 ### 2.A.8 Calibration checkpoint (pre-launch, PRD-exact)
 Pre-launch generator calibration gate:
 - run generator on 20 representative profiles.
@@ -640,18 +660,24 @@ This is a release-readiness calibration checkpoint; it is not replaced by runtim
 
 ### 2.A.9 Substitution algorithm and load handling (PRD-exact MVP)
 Substitution trigger: unavailable equipment, pain suppression, user skip-request per exercise.
+Substitution scoring (PRD-exact):
+- Preserve movement intent: `+40`
+- Preserve primary muscle: `+25`
+- Similar difficulty/fatigue cost within one tier: `+10`
+- Prior successful history: `+8`
+- Apply standard disliked/repeatedly-skipped penalties.
 Algorithm:
 1) find candidate pool with same movement_intent.
-2) score per §2.A.6.
+2) score using the substitution scoring above and applicable penalties.
 3) apply §2.A.7 fallback only when required.
-4) choose deterministic top candidate by PRD tie-breaker order.
+4) choose deterministic top candidate by §2.A.6 tie-breaker order.
+5) preserve planned set count and rep range when possible.
 Load handling:
 - if user has history with substitute and last successful set met minimum target reps, suggest that last successful load.
 - if no history, leave load blank and attach conservative-start prompt.
 - bodyweight substitutions: prescribe bodyweight/assisted/variation level.
 - machine/non-comparable load scales: leave load blank.
 MVP forbids carrying load unchanged by default and forbids bilateral→unilateral conversion heuristics unless introduced as explicitly labeled post-MVP/open decision.
-
 ### 2.A.10 Generator outputs
 Plan-level explanation output schema (`plan_version.validation_warnings_json` companion API field `planExplanation`):
 - `templateChosen`
@@ -763,7 +789,7 @@ Common:
 
 3) `POST /v1/plans/{planVersionId}/regenerate`
 - Headers: `Idempotency-Key` required
-- Body: `{ "versionToken": 4, "reason":"equipment_change" }`
+- Body: `{ "versionToken": 4, "reason":"regenerate", "generationTrigger":"equipment_change" }`
 - Success `201`: new draft planVersion (new id), prior plan untouched.
 
 4) `POST /v1/plans/{planVersionId}/revert`
@@ -1225,7 +1251,7 @@ Blocking decisions outside this contract (if unresolved in PRD) must remain flag
 - [x] Regeneration and local-draft safety matrix fully specified.
 
 ### B) Architecture-freeze ready
-- [ ] RLS/FK/trigger/RPC enforcement finalized with explicit per-table permissions and domain errors.
+- [ ] RLS/FK/trigger/RPC enforcement finalized with explicit per-table permissions and domain errors (still missing: finalized per-endpoint RPC error-code matrix sign-off and migration-generated policy verification evidence).
 - [x] Acceptance tests mapped to high-risk flows and invariants.
 - [ ] All §9 PRD open decisions closed (required before architecture-freeze can be marked complete).
 - [x] PRD open decisions explicitly listed as blockers while unresolved.
@@ -1239,7 +1265,7 @@ Blocking decisions outside this contract (if unresolved in PRD) must remain flag
 
 
 ## 11) Patch Summary
-- Sections amended: §2.1, §2.6, §2.9, §2.B.1.A, §3.7, §3.12–§3.16, §5.1, §6/§6.1, §8.1, §9, §10.
-- Sections added: §2.9.A (`trust_survey_response`), §3.12 (trust survey endpoint), §3.13 (account deletion request endpoint).
+- Sections patched: §2.A.2, §2.A.3, §2.A.4, §2.A.6, §2.A.7, §2.A.9, §2.10, §3.1, §10.B, and PRD-exact labeling language in affected subsections.
 - Sections deleted: none.
-- Remaining blockers before production implementation readiness: PRD §0 pre-build gates, unresolved PRD open decisions in §9 (including legal/privacy retention copy), generated migrations/RPC implementation completion, and CI e2e pass of §6 acceptance suite.
+- Remaining blockers before production implementation: PRD §0 pre-build gates must pass/sign-off; all §9 open PRD decisions must be closed; migration DDL and RPC implementations must be generated from this contract; CI integration/e2e must pass §6 acceptance tests; and §10.B architecture-freeze checklist items must be complete.
+- Confirmation: no schema/API/RLS/sync/state-machine/acceptance-test detail was removed or compressed; edits are surgical consistency patches within affected subsections only.
