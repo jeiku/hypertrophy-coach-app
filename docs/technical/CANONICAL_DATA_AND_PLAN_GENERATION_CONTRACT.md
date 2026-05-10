@@ -1,6 +1,6 @@
 # CANONICAL DATA AND PLAN GENERATION CONTRACT (FINAL MVP BUILD CONTRACT)
 
-**Status:** Draft contract revision for implementation readiness (see §10 gates).  
+**Status:** Draft contract revision; **not implementation-ready** until §10 blockers are fully closed.  
 **Source of truth:** `PRDv0.6.md`  
 **Revision date:** 2026-05-10
 
@@ -439,7 +439,7 @@ Constraints/indexes:
 
 ---
 
-## 2.A) Plan Generator Contract (deterministic, implementation-ready)
+## 2.A) Plan Generator Contract (deterministic, implementation-ready target; MVP constraints enforced)
 
 ### 2.A.1 Movement-intent slot taxonomy
 `movement_intent` enum domain used by generator and catalog:
@@ -470,38 +470,29 @@ Generator slot object schema:
 - `targetRirMin numeric(3,1) null`
 - `targetRirMax numeric(3,1) null`
 
-### 2.A.2 Split templates by days/week
-- 2 days/week: full-body A/B; each day requires 1 squat/leg, 1 hinge/posterior, 1 push, 1 pull, 1 accessory/core.
-- 3 days/week: full-body A/B/C; each day includes lower + upper push/pull + one accessory.
-- 4 days/week: upper/lower split (Upper A, Lower A, Upper B, Lower B).
-- 5 days/week: push/pull/legs + upper/lower hybrid.
-- 6 days/week: push/pull/legs repeated with A/B exercise variation.
-Template resolution is deterministic by `(daysPerWeek, goalType, experienceLevel)` with fixed slot counts per template.
+### 2.A.2 Split templates by days/week (PRD-exact)
+- 2 days/week: Full Body A/B.
+- 3 days/week: Full Body A/B/C.
+- 4 days/week: Upper/Lower.
+- 5 days/week: Upper/Lower + 1 focus day.
+- 6 days/week, beginner: Full Body x6 with conservative volume.
+- 6 days/week, intermediate: PPL x2.
+Deterministic template resolution keys: `(daysPerWeek, experienceLevel)`.
+MVP `goalType` is recorded-only metadata and MUST NOT affect template choice, slot counts, volume targets, exercise selection, progression, or recommendation decisions.
 
-### 2.A.3 Initial weekly volume targets (working sets)
-- beginner: major groups 8–12 sets/week; minor groups 4–8.
-- intermediate: major groups 10–16; minor groups 6–10.
-Goal adjustment:
-- bulk: +2 sets/week to chest, back, quads, hamstrings.
-- cut: -2 sets/week global floor 6 major / 3 minor.
-- recomp: baseline.
+### 2.A.3 Initial weekly volume targets (PRD muscle-by-muscle tables)
+Generator SHALL use the PRD v0.6 explicit beginner/intermediate muscle-by-muscle weekly set ranges (no major/minor substitution).
+- no history -> initialize at low end of PRD range.
+- generator target -> midpoint of PRD range.
+- progression volume increases are gated: minimum 14 consecutive days of adherence consistency and no high-soreness paired signal and no pain flag.
+Any stored copy of ranges in code/data must remain field-equivalent to PRD tables.
 
-### 2.A.4 Duration estimation formula and accessory-cut priority
-Estimated session duration formula:
-`sum(sets * (avgRepSeconds * avgTargetReps + restSeconds + transitionSeconds)) + warmupOverhead + setupOverhead`
-Constants:
-- `avgRepSeconds = 4`
-- `transitionSeconds = 20` between sets
-- use exercise-specific `rest_seconds`, `tempo_seconds`, `warmup_overhead`, `setup_overhead` from catalog.
-If estimated duration exceeds `goal_plan.session_length_min` by >10%:
-cut order (highest priority cut first):
-1) `arm_elbow_flexion`
-2) `arm_elbow_extension`
-3) `lateral_deltoid`
-4) `rear_deltoid`
-5) `calf_plantarflexion`
-6) secondary core slot
-Never cut below template-required compound intents.
+### 2.A.4 Duration estimation and accessory-cut priority (PRD-exact)
+Core duration estimate per session uses exercise-specific values:
+`sum_over_exercises(sum_over_sets(target_reps * tempo_seconds + rest_seconds) + warmup_overhead + setup_overhead)`.
+No fixed global `avgRepSeconds` constant is permitted as the core estimation rule.
+Threshold: run cut policy when estimated duration `> target_session_minutes * 1.15`.
+Accessory-cut priority is PRD-ordered and MUST preserve PRD focus-muscle protection and PRD set-count reduction floors before any slot drop.
 
 ### 2.A.5 Hard disqualifiers
 Candidate exercise is ineligible if any true:
@@ -511,58 +502,51 @@ Candidate exercise is ineligible if any true:
 - exercise marked disliked with active pain flag for matching location in last 14 days.
 - experience level below `experience_level_min`.
 
-### 2.A.6 Selection rule precedence, scoring weights, tie-breakers
-Precedence:
-1. hard disqualifiers
-2. safety suppressions from check-ins/limitations
-3. template slot fit
-4. duration budget compliance
-5. variety constraints
-6. preference optimization
-Score (0-100):
-- movement-intent fit: 30
-- equipment fit simplicity: 15
-- preference signal: 15
-- fatigue-cost alignment: 15
-- recency penalty inversion (less recent = better): 15
-- unilateral/bilateral slot match: 10
-Tie-breakers in order:
-1) lower fatigue_cost
-2) lower setup_overhead
-3) less used in previous 21 days
-4) lexical `exercise_key` ascending (determinism)
+### 2.A.6 Selection rule precedence, scoring weights, tie-breakers (PRD-exact)
+Scoring components:
+- Movement-intent match `+40`
+- Same primary muscle `+25`
+- Beginner-friendly `+15`
+- Focus muscle `+10`
+- User preferred `+10`
+- Prior successful history `+8`
+- Low setup complexity when short session `+5`
+- High fatigue cost on back-to-back day `-10`
+- Recently skipped 3+ times `-20`
+- User disliked `-30`
+Tie-breakers: MUST follow PRD exact order (no substitutions).
 
-### 2.A.7 Cross-slot exclusion, variety enforcement, unfillable-slot fallback
+### 2.A.7 Cross-slot exclusion, variety enforcement, unfillable-slot fallback (PRD-exact)
 Cross-slot exclusion in same day:
 - cannot assign same `exercise_catalog_id` to >1 slot.
 - cannot assign two hinge-intent heavy spinal-loading lifts if both fatigue_cost >=4.
-Variety enforcement:
-- no exact exercise repeat across consecutive workouts for same intent unless option pool <2.
-- weekly unique count minimum: 1 unique per compound intent for 2-3 days; 2 unique per compound intent for 4-6 days.
-Unfillable fallback order:
-1) substitute nearest intent from approved adjacency map.
-2) reduce set count of adjacent slot and add time-neutral alternative.
-3) mark slot `unfilled` and emit validation warning with reason code.
+Variety enforcement remains as previously specified.
+Unfillable fallback order when max score `< 0` after filters/exclusions:
+1) ignore disliked penalty.
+2) ignore preferred boost.
+3) if still `< 0` or pool empty: drop slot and emit validation warning.
+Nearest-intent substitution and slot rewrite are NOT allowed in this fallback path unless PRD explicitly permits for that slot class.
 
-### 2.A.8 Calibration checkpoint
-After first 2 completed sessions in new plan version:
-- recompute per-slot difficulty using achieved reps/RIR.
-- if >70% working sets report RIR 0-1, lower planned load 2.5-5% for affected intent.
-- if >70% sets hit top reps with RIR >=3, raise planned load 2.5%.
-No structural slot changes at checkpoint; load/rep tuning only.
+### 2.A.8 Calibration checkpoint (pre-launch, PRD-exact)
+Pre-launch generator calibration gate:
+- run generator on 20 representative profiles.
+- coach review outputs against PRD acceptance rubric.
+- if pass rate `<85%`, tune scoring weights and rerun until threshold met.
+This is a release-readiness calibration checkpoint; it is not replaced by runtime after-two-sessions auto-adjustment.
 
-### 2.A.9 Substitution algorithm and load handling
+### 2.A.9 Substitution algorithm and load handling (PRD-exact MVP)
 Substitution trigger: unavailable equipment, pain suppression, user skip-request per exercise.
 Algorithm:
 1) find candidate pool with same movement_intent.
-2) if empty, use adjacent intent map with penalty -15 score.
-3) re-score with current constraints.
-4) choose top deterministic candidate.
+2) score per §2.A.6.
+3) apply §2.A.7 fallback only when required.
+4) choose deterministic top candidate by PRD tie-breaker order.
 Load handling:
-- if old and new have same load modality, carry load unchanged.
-- if bilateral -> unilateral dumbbell, set each side load to `roundToNearest(0.5, old_load * 0.5)`.
-- if barbell -> machine/cable unknown ratio, clear load and keep rep/RIR targets.
-- warmup sets regenerated from working set estimate tables.
+- if user has history with substitute and last successful set met minimum target reps, suggest that last successful load.
+- if no history, leave load blank and attach conservative-start prompt.
+- bodyweight substitutions: prescribe bodyweight/assisted/variation level.
+- machine/non-comparable load scales: leave load blank.
+MVP forbids carrying load unchanged by default and forbids bilateral→unilateral conversion heuristics unless introduced as explicitly labeled post-MVP/open decision.
 
 ### 2.A.10 Generator outputs
 Plan-level explanation output schema (`plan_version.validation_warnings_json` companion API field `planExplanation`):
@@ -579,50 +563,34 @@ Validation warning object schema:
 Movement coverage summary output:
 - per movement intent: `targetSets`, `assignedSets`, `coverageStatus enum(full|partial|missing)`.
 
-## 2.B) Progression and Recommendation Rules (implementation-ready)
+## 2.B) Progression and Recommendation Rules (PRD-exact precedence/threshold contract)
 
-### 2.B.1 Double-progression algorithm
-For each working set in an exercise intent block:
-- keep load fixed until user hits `targetRepMax` for all working sets at/above `targetRirMin` and at/below `targetRirMax` in 2 consecutive exposures.
-- then increase load by increment table and reset target to lower rep boundary.
-Increment table:
-- barbell lower: +5 kg / +10 lb
-- barbell upper: +2.5 kg / +5 lb
-- dumbbell/cable/machine: next available step (usually +1 to +2.5 kg each side)
+### 2.B.1 Recommendation precedence (strict order)
+`pain/safety -> reduce -> hold -> increase -> default hold/add reps`.
 
-### 2.B.2 Recommendation precedence and thresholds
-Precedence (highest first): pain/safety suppression > deload > reduce > hold > add load > add reps.
-Thresholds evaluated from last 2 exposures for same exercise intent:
-- add-load: all working sets at target_rep_max with average RIR >= targetRirMin and <= targetRirMax+0.5.
-- hold: at least 70% sets within rep range and RIR within target band.
-- reduce: fewer than 50% sets achieve target_rep_min or form_breakdown true once with RIR <=0.5.
-- deload: two consecutive sessions with reduce condition OR fatigue_level high + soreness high + form_breakdown true.
-RIR behavior:
-- RIR < targetRirMin on majority sets suppresses add-load.
-- RIR > targetRirMax+1 for two exposures triggers add-reps recommendation first, then add-load.
-Fatigue/form behavior:
-- fatigue high or form_breakdown true limits recommendations to hold/reduce/deload.
-Pain/safety suppression:
-- active pain_flag for location mapped to movement intent blocks add-load/add-reps and enables substitute/reduce/deload only.
+### 2.B.2 Load increase threshold
+All conditions required:
+- all planned working sets completed.
+- top-rep condition true: either all sets at top rep OR all sets within 1 rep of top and prior comparable session also met this condition.
+- no pain flag.
+- fatigue not high.
+- no form breakdown.
 
-### 2.B.3 Ignored recommendation feedback rules
-When user ignores same recommendation type for same target 3 times in 21 days:
-- cooldown 14 days for that type+target.
-- future recommendations require confidence score +10 over normal threshold.
-`ignoredReason=no_reason_given` does not alter thresholds; explicit reasons do.
+### 2.B.3 Hold and reduce thresholds
+Hold and reduce thresholds MUST match PRD v0.6 exact definitions; no two-exposure RIR-band replacement permitted.
 
-### 2.B.4 Structured reason object and Why? requirements
-Each recommendation includes machine-readable reason object:
-- `reasonCode`
-- `observedMetrics` {repsHitRate, avgRir, fatigueLevel, painFlag, formBreakdownCount}
-- `thresholdsEvaluated` array
-- `decisionPath` ordered strings
-API must expose `why` block with:
-- short explanation <= 220 chars
-- detailed explanation <= 1200 chars
-- top 3 contributing factors with signed effect size.
+### 2.B.4 Deload threshold and application
+Deload recommendation threshold: at least 3 of 5 PRD deload signals within trailing 7 days.
+Deload is recommendation-only, never auto-applied, and requires explicit user confirmation.
 
-
+### 2.B.5 Structured reason object and Why? requirements (PRD)
+Every recommendation object MUST include:
+- `recommendationType`
+- `triggerFactors`
+- `userFacingReason`
+- `educationalContext`
+UI contract: always expose `userFacingReason` first; `educationalContext` is shown on deeper tap.
+Additional machine-readable fields are additive only and MUST NOT replace these four required fields.
 
 ## 3) API contract (full endpoints)
 
@@ -928,7 +896,7 @@ Conflict handling codes:
 - `DUPLICATE_CLIENT_MUTATION_ID`: non-fatal replay list in success payload.
 - `PARTIAL_SYNC_CONFLICT`: return merged summary + unresolved item list.
 
-## 5.A) RLS/FK/trigger/RPC enforcement expansion
+## 5.A) RLS/FK/trigger/RPC enforcement expansion (per-table matrix required)
 Per-table RLS matrix (C=client, S=service):
 - user-owned mutable tables (`user_profile`, `goal_plan`, `equipment_profile`, `equipment_profile_item`, `user_exercise_preference`, `user_limitation`, `notification_preference`, `workout_session`, `set_log`, `post_workout_check_in`, `recommendation`): C select/update/insert/delete with `user_id=auth.uid()` checks as applicable.
 - generated plan structure (`plan_version`, `workout_day`, `exercise_instance`, `set_prescription`): C select only; writes via RPC under S.
