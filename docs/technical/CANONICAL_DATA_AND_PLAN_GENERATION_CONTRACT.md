@@ -187,6 +187,7 @@ Columns:
 - `cue_common_mistake text not null check (char_length(cue_common_mistake) between 10 and 500)`
 - `cue_safety_note text null check (cue_safety_note is null or char_length(cue_safety_note) between 10 and 500)`
 - `experience_level_min experience_level not null`
+- `experience_levels_allowed experience_level[] not null default '{beginner,intermediate}'`
 - `is_unilateral boolean not null default false`
 - `is_active boolean not null default true`
 - `metadata_json jsonb not null default '{}'::jsonb`
@@ -196,7 +197,7 @@ Columns:
 Constraints/indexes:
 - GIN indexes on `movement_intents`, `suppression_tags`, `primary_muscles`, `equipment_keys`.
 - `suppression_tags` values must come from canonical domain: `chest`,`shoulders`,`back_compound_pull`,`triceps_overhead_loaded`,`biceps`,`triceps`,`loaded_grip_pull`,`loaded_pressing`,`loaded_pulling`,`posterior_chain_loaded`,`spinal_loading`,`rows`,`pull_ups`,`loaded_carries`,`squat_pattern`,`hinge_pattern`,`lunge_pattern`,`leg_extension`,`leg_press`,`calf`,`loaded_standing`,`horizontal_pull`.
-- checks: `cardinality(movement_intents)>=1`, `cardinality(primary_muscles)>=1`, `cardinality(equipment_keys)>=1`.
+- checks: `cardinality(movement_intents)>=1`, `cardinality(primary_muscles)>=1`, `cardinality(equipment_keys)>=1`, `cardinality(experience_levels_allowed)>=1`, and `experience_level_min = any(experience_levels_allowed)`.
 - all cue/timing columns required (non-null) for seeded active exercises.
 
 Seed count contract:
@@ -610,7 +611,7 @@ Candidate exercise is ineligible if any true:
 - active pain-location suppression mapping (§2.B.1.A) or active hard-block limitation contraindicates movement intent/muscle/equipment.
 
 `disliked` is NOT a hard disqualifier; it remains a scoring penalty in §2.A.6 and may be relaxed only via §2.A.7 fallback.
-Experience-level filter (`experience_level_min`) applies only when at least one alternative eligible candidate exists for the slot; if no alternative exists, this filter must be relaxable in unfillable-slot fallback before slot-drop.
+Experience-level eligibility filter uses `experience_levels_allowed` as the canonical machine-testable allowlist (with `experience_level_min` retained for scoring/tie-break context). Exercises where the trainee level is not in `experience_levels_allowed` are initially ineligible; if no alternative eligible candidate exists for the slot, this eligibility gate is relaxable in unfillable-slot fallback before slot-drop (PRD-exact relax-only-when-no-alternative behavior).
 
 ### 2.A.6 Selection rule precedence, scoring weights, tie-breakers (PRD-exact rule precedence + tie-breakers)
 Scoring components:
@@ -1149,7 +1150,8 @@ Hard guarantees:
 Implementation rules by table:
 - Client `select`: all user-owned tables where `user_id=auth.uid()`.
 - Client `insert/update/delete`: only on user-owned mutable tables listed in §2, with column restrictions via RPC where specified.
-- Service-role-only writes: `exercise_catalog`, `equipment_catalog`, and planned structure tables (`plan_version`, `workout_day`, `exercise_instance`, `set_prescription`) except via approved RPC.
+- No direct client write policies for service-role-owned/planned-structure tables: `exercise_catalog`, `equipment_catalog`, and planned structure tables (`plan_version`, `workout_day`, `exercise_instance`, `set_prescription`) except via approved RPC/service role paths.
+- Owner-scoped client reads are allowed where explicitly listed in §5.1 (including plan/workout structure rows), and seed catalog reads are allowed only for active rows (`is_active=true`).
 
 RPC-only state transitions:
 - workout session status transitions
@@ -1204,16 +1206,18 @@ Domain errors: cross-user access always `403 FORBIDDEN_RESOURCE`; same-user inva
 Named RPC list and contracts:
 - `rpc_generate_plan(goal_plan_id uuid, equipment_profile_id uuid, preferred_weekdays week_day[]) -> plan_version_payload` errors: `422 GENERATION_UNFILLABLE`, `403`.
 - `rpc_accept_plan(plan_version_id uuid, version_token int) -> plan_version` errors: `409 VERSION_CONFLICT`.
-- `rpc_regenerate_plan(plan_version_id uuid, version_token int, reason text) -> plan_version_payload`.
+- `rpc_regenerate_plan(plan_version_id uuid, version_token int, reason text, generation_trigger text) -> plan_version_payload`.
 - `rpc_revert_plan(plan_version_id uuid, version_token int) -> plan_version_payload`.
 - `rpc_transition_workout_session(session_id uuid, action text, version_token int, payload jsonb) -> workout_session`.
 - `rpc_append_set_logs(session_id uuid, version_token int, entries jsonb) -> set_log_result`.
 - `rpc_recover_local_draft(payload jsonb) -> recovery_result`.
-- `rpc_apply_recommendation_action(recommendation_id uuid, action text, version_token int, ignored_reason text) -> recommendation`.
+- `rpc_apply_recommendation_action(recommendation_id uuid, action text, version_token int, ignored_reason text, ignored_reason_text text null) -> recommendation`.
 - `rpc_apply_substitution(target_context text, plan_version_id uuid, workout_day_id uuid, workout_session_id uuid, exercise_instance_id uuid, replacement_exercise_catalog_id uuid, version_token int, idempotency_key text) -> substitution_result`; verifies ownership, validates FK chain to selected context, requires matching version token on mutable parent (`plan_version` for future_plan or `workout_session` for session_override), idempotent on `(user_id,idempotency_key,exercise_instance_id,replacement_exercise_catalog_id)`, errors: `403 FORBIDDEN_RESOURCE`, `409 VERSION_CONFLICT`, `422 FK_OWNERSHIP_VIOLATION|INVALID_SUBSTITUTION_TARGET|PAIN_SUPPRESSION_CONFLICT`.
 - `rpc_add_equipment_item(equipment_profile_id uuid, equipment_profile_version_token int, equipment_key text, idempotency_key text) -> equipment_profile_item_result`; validates ownership + `equipment_key` exists and active, bumps parent token +1, idempotent replay returns existing row, errors: `409 VERSION_CONFLICT`, `422 INVALID_EQUIPMENT_KEY|DUPLICATE_EQUIPMENT_ITEM`.
 - `rpc_remove_equipment_item(equipment_profile_id uuid, equipment_profile_item_id uuid, equipment_profile_version_token int, idempotency_key text) -> equipment_profile_item_result`; validates ownership chain/profile membership, enforces non-negative remaining item rules from generator preconditions, bumps parent token +1, idempotent delete replay acknowledged, errors: `409 VERSION_CONFLICT`, `422 FK_OWNERSHIP_VIOLATION|MIN_EQUIPMENT_VIOLATION`.
 - `rpc_upsert_post_workout_check_in(workout_session_id uuid, version_token int, payload jsonb, idempotency_key text) -> post_workout_check_in`; validates ownership + session mutability, upsert-by-session semantics with token increment exactly +1, same key+payload replay safe, errors: `409 VERSION_CONFLICT`, `422 INVALID_STATE_TRANSITION|CHECKIN_SCHEMA_INVALID`.
+- `rpc_upsert_trust_survey_response(week_index int, trust_rating int, submitted_at timestamptz, version_token int, idempotency_key text) -> trust_survey_response`; validates `(user_id,week_index)` ownership semantics, enforces required optimistic concurrency token behavior from §3.12, errors: `409 VERSION_CONFLICT`, `422 TRUST_SURVEY_SCHEMA_INVALID`.
+- `rpc_request_account_deletion(version_token int, idempotency_key text) -> deletion_request_result`; server-only mutation of `user_profile.pending_deletion_at` and `user_profile.hard_delete_by`, enforces ownership and policy gates, same-key replay safe, errors: `409 VERSION_CONFLICT`, `422 INVALID_STATE_TRANSITION|ACCOUNT_DELETION_POLICY_BLOCKED`.
 
 Trigger names/responsibilities:
 - `trg_set_updated_at_*`: set `updated_at=now()`.
@@ -1245,6 +1249,16 @@ For each named RPC and mutable endpoint, contract requires: allowed caller, owne
 | `rpc_remove_equipment_item` / `DELETE .../items/{itemId}` | Auth user | profile/item ownership chain | Required exact parent token | Required key; replay acknowledged | Single tx delete/archive item + bump token | equipment item deletion effect | `403`, `409 VERSION_CONFLICT`, `422 FK_OWNERSHIP_VIOLATION`, `422 MIN_EQUIPMENT_VIOLATION` |
 | `rpc_recover_local_draft` / `POST /v1/sync/local-drafts/recover` | Auth user | ownership and plan/day/session chain per recovery path | Required when attaching to existing mutable session | Required key | Single recovery tx (create or attach path) | session recovered + set-log replay | `403`, `409 STALE_VERSION_TOKEN`, `409 SESSION_ALREADY_COMPLETED`, `422 PLAN_VERSION_MISMATCH`, `422 WORKOUT_DAY_MISMATCH` |
 | `rpc_upsert_trust_survey_response` / `POST /v1/trust-survey` | Auth user | row ownership by `(user_id,week_index)` | Required exact (as §3.12) | Required key | Upsert tx | trust row insert/update + token bump | `403`, `409 VERSION_CONFLICT`, `422 TRUST_SURVEY_SCHEMA_INVALID` |
+| `PUT /v1/user-profile` | Auth user | `user_profile.user_id = auth.uid()` only; cross-user denied | Required exact `user_profile.version_token` | Required key; same payload replay returns current row | Single-row update tx | profile fields updated + `version_token` +1 + `updated_at` | `403 FORBIDDEN_RESOURCE`, `409 VERSION_CONFLICT`, `422 USER_PROFILE_SCHEMA_INVALID` |
+| `POST /v1/goal-plans` | Auth user | `goal_plan.user_id = auth.uid()`; enforce single active goal invariant | Not required for create | Required key; replay returns created goal row | Single-row insert tx | new goal plan created (`status='active'`) and prior active goal archived in same tx when applicable | `403 FORBIDDEN_RESOURCE`, `422 GOAL_PLAN_SCHEMA_INVALID`, `422 INVALID_STATE_TRANSITION` |
+| `PATCH /v1/goal-plans/{id}` | Auth user | target goal ownership + valid status transition chain | Required exact `goal_plan.version_token` | Required key; replay safe | Single-row update tx | goal fields/status update + token bump | `403 FORBIDDEN_RESOURCE`, `409 VERSION_CONFLICT`, `422 GOAL_PLAN_SCHEMA_INVALID`, `422 INVALID_STATE_TRANSITION` |
+| `POST /v1/equipment-profiles` | Auth user | `equipment_profile.user_id = auth.uid()` | Not required for create | Required key; replay returns created profile | Single-row insert tx | equipment profile created + default active semantics per §3 | `403 FORBIDDEN_RESOURCE`, `422 EQUIPMENT_PROFILE_SCHEMA_INVALID` |
+| `PATCH /v1/equipment-profiles/{id}` | Auth user | profile ownership | Required exact `equipment_profile.version_token` | Required key; replay safe | Single-row update tx | equipment profile update + token bump | `403 FORBIDDEN_RESOURCE`, `409 VERSION_CONFLICT`, `422 EQUIPMENT_PROFILE_SCHEMA_INVALID` |
+| `DELETE /v1/equipment-profiles/{id}` | Auth user | profile ownership + ownership chain for child items | Required exact `equipment_profile.version_token` | Required key; replay acknowledged for already-archived target | Single tx archive/delete profile and apply active-profile invariant adjustments | profile archived/deleted per §3 + token bump/invariant upkeep | `403 FORBIDDEN_RESOURCE`, `409 VERSION_CONFLICT`, `422 FK_OWNERSHIP_VIOLATION`, `422 INVALID_STATE_TRANSITION` |
+| Exercise preference mutators (`POST/PATCH/DELETE /v1/exercise-preferences...`) | Auth user | preference row ownership + `exercise_catalog` FK validity (`is_active=true`) | POST: not required; PATCH/DELETE: required exact `user_exercise_preference.version_token` | Required key; create replay returns same row; patch/delete replay safe | Single-row tx per mutation | create/update/delete (or archive if soft-delete) preference row + token bump on mutable updates | `403 FORBIDDEN_RESOURCE`, `409 VERSION_CONFLICT`, `422 FK_OWNERSHIP_VIOLATION`, `422 EXERCISE_PREFERENCE_SCHEMA_INVALID` |
+| User limitation mutators (`POST /v1/user-limitations`, `PATCH /v1/user-limitations/{id}`, `POST /v1/user-limitations/{id}/resolve`) | Auth user | limitation ownership; resolve path enforces active->resolved transition | POST: not required; PATCH/resolve: required exact `user_limitation.version_token` | Required key for each; replay safe | Single-row tx per mutation (resolve may be RPC path) | limitation created/updated/resolved + token bump | `403 FORBIDDEN_RESOURCE`, `409 VERSION_CONFLICT`, `422 USER_LIMITATION_SCHEMA_INVALID`, `422 INVALID_STATE_TRANSITION` |
+| `PATCH /v1/notification-preferences` | Auth user | `notification_preference.user_id = auth.uid()` | Required exact `notification_preference.version_token` | Required key; replay safe | Single-row upsert/update tx | notification preferences updated + token bump | `403 FORBIDDEN_RESOURCE`, `409 VERSION_CONFLICT`, `422 NOTIFICATION_PREFERENCES_SCHEMA_INVALID` |
+| `rpc_request_account_deletion` / `POST /v1/account/deletion-request` | Auth user | only own `user_profile` mutable; no direct client write to `pending_deletion_at`/`hard_delete_by` columns | Required exact `user_profile.version_token` | Required key; replay returns same pending-deletion state | Single tx sets deletion timestamps + audit record and activates pending-deletion RLS gating | `user_profile.pending_deletion_at` + `hard_delete_by` server-set, token +1 | `403 FORBIDDEN_RESOURCE`, `409 VERSION_CONFLICT`, `422 INVALID_STATE_TRANSITION`, `422 ACCOUNT_DELETION_POLICY_BLOCKED` |
 
 Migration-generated policy verification evidence remains a later implementation-readiness deliverable in §10.C and is not marked complete in this contract revision.
 
@@ -1359,7 +1373,7 @@ Analytics preference support:
 
 Trust survey capture (week-4 metric minimum contract):
 - `POST /v1/trust-survey` request `{ versionToken:number, weekIndex:4, trustRating:1..5, submittedAt:timestamptz }` and response with incremented `versionToken`.
-- Persist minimal record in `trust_survey_response` (`id`, `user_id`, `week_index`, `trust_rating`, `submitted_at`, `created_at`) for metric calculation; no free-text required in MVP.
+- Persist using canonical `trust_survey_response` table contract in §2.9.A (including `updated_at` and `version_token`); request `versionToken` remains required, and successful upsert increments `version_token` exactly +1 for metric-safe concurrency.
 
 ## 9) Open decisions inherited from PRD
 
@@ -1383,7 +1397,8 @@ Blocking decisions outside this contract (if unresolved in PRD) must remain flag
 - [x] Regeneration and local-draft safety matrix fully specified.
 
 ### B) Architecture-freeze ready
-- [ ] RLS/FK/trigger/RPC enforcement finalized with explicit per-table permissions and domain errors (still missing: finalized per-endpoint RPC error-code matrix sign-off and migration-generated policy verification evidence).
+- [x] Contract content finalized for RLS/FK/trigger/RPC enforcement with explicit per-table permissions, named RPC contracts, and complete mutable-endpoint error-code matrix.
+- [ ] Migration-generated policy verification evidence produced and reviewed (implementation artifact; not a contract-text gap).
 - [x] Acceptance tests mapped to high-risk flows and invariants.
 - [ ] All contract §9 open decisions inherited from the PRD / PRD open decisions closed (required before architecture-freeze can be marked complete).
 - [x] PRD open decisions explicitly listed as blockers while unresolved.
@@ -1397,7 +1412,8 @@ Blocking decisions outside this contract (if unresolved in PRD) must remain flag
 
 
 ## 11) Patch Summary
-- Sections patched: §Status line, §2.1, §2.10, §2.12, §2.A.10, §2.B.1.A, §3.1, §3.10, §3.14.2, §3.16.1, §3.16.6, §5.2, §6, §10.B, and this §11 summary.
+- Sections patched: §2.6 (`exercise_catalog` eligibility fields/checks), §2.A.5 (experience-level hard-disqualifier/fallback behavior), §4.1.4 (sync/local draft transitions table format validation), §5 (RLS wording consistency), §5.1 (named RPC signatures/contracts list), §5.2 (expanded mutable endpoint + RPC error-code matrix), §6 (trust-survey persistence consistency text), §10.B (readiness checklist accuracy), and this §11 summary.
 - Sections deleted: none.
-- Remaining blockers before production implementation: PRD §0 pre-build gates must pass/sign-off; all §9 open PRD decisions must be closed; migration DDL and RPC implementations must be generated from this contract; CI integration/e2e must pass §6 acceptance tests; and §10.B architecture-freeze checklist items must be complete.
-- Confirmation: no schema/API/RLS/sync/state-machine/acceptance-test detail was removed or compressed; edits are surgical consistency patches within affected subsections only.
+- Remaining blockers before production implementation: PRD §0 pre-build gates must pass/sign-off; all §9 open PRD/contract decisions must be closed; migration DDL and RPC implementations must be generated from this contract; and CI integration/e2e must pass §6 acceptance tests.
+- Architecture-freeze remains blocked only by unresolved external/open-decision evidence and implementation artifacts (not by missing contract matrix/RLS/RPC text after this patch).
+- Confirmation: this patch preserved existing schema/API/RLS/sync/state-machine/acceptance-test detail and only added/amended targeted consistency and implementation-safety content.
