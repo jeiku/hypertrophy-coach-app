@@ -1,6 +1,6 @@
 # CANONICAL DATA AND PLAN GENERATION CONTRACT (FINAL MVP BUILD CONTRACT)
 
-**Status:** Draft contract revision; eligible for engineering estimation and architecture review only. Architecture-freeze readiness is not complete and cannot be marked complete while the contract §9 open decisions inherited from the PRD / PRD open decisions remain unresolved. Production implementation remains blocked until §10.C.1 (PRD §0 pre-build gates passed and signed off) is true and §10.B is fully complete.  
+**Status:** Draft contract revision; contract-complete for engineering estimation and architecture review only. Build-start readiness is not complete and cannot be marked complete while PRD §0 pre-build gates are not passed/signed off, contract §9 open decisions inherited from the PRD / PRD open decisions remain unresolved, or applicable content/seed/legal/safety/accessibility ownership blockers remain unresolved. Production implementation/release validation is not marked ready in this revision.  
 **Source of truth:** `PRDv0.6.md`  
 **Revision date:** 2026-05-10
 
@@ -1416,31 +1416,34 @@ Blocking decisions outside this contract (if unresolved in PRD) must remain flag
 
 ---
 
-## 10) Implementation readiness checklist
+## 10) Readiness checklist (contract vs build-start vs implementation/release validation)
 
 ### A) Contract-complete for engineering estimation
 - [x] All MVP schemas fully defined (columns/types/nullability/defaults/enums/FKs/uniques/checks/indexes/ownership/versioning/API mapping).
 - [x] All endpoints include method/path/auth/headers/request-success-errors/versionToken/idempotency/RLS/transaction notes.
 - [x] Regeneration and local-draft safety matrix fully specified.
 
-### B) Architecture-freeze ready
+### B) Build-start readiness (implementation may begin only when these are true)
+- [ ] PRD §0 pre-build gates are passed and signed off.
+- [ ] All contract §9 open decisions inherited from the PRD / PRD open decisions are closed.
+- [ ] Applicable content/seed/legal/safety/accessibility ownership blockers are resolved.
 - [x] Contract content finalized for RLS/FK/trigger/RPC enforcement with explicit per-table permissions, named RPC contracts, and complete mutable-endpoint error-code matrix.
-- [ ] Migration-generated policy verification evidence produced and reviewed (implementation artifact; not a contract-text gap).
 - [x] Acceptance tests mapped to high-risk flows and invariants.
-- [ ] All contract §9 open decisions inherited from the PRD / PRD open decisions closed (required before architecture-freeze can be marked complete).
 - [x] PRD open decisions explicitly listed as blockers while unresolved.
 
-### C) Production implementation ready
-- [ ] PRD §0 pre-build gates are passed and signed off; production implementation remains blocked until this is true.
+### C) Implementation/release validation artifacts (post-build-start; not contract-text or pre-build blockers)
 - [ ] Migration DDL generated exactly from this contract.
 - [ ] RPCs implement all state transitions and idempotency semantics.
 - [ ] Integration/e2e suite passes all §6 tests in CI.
+- [ ] Migration-generated policy verification evidence produced and reviewed.
 - [x] Placeholder/meta references to former subsection labels removed or rewritten to current section references where applicable.
 
 
 ## 11) Patch Summary
 - Sections patched (surgical only): §2.14/§2.15 (soft-delete retention implementability via `deleted_at` and exclusion rules), §2.B (PRD safety/recovery additions + `educationalContext` optional/nullable wording alignment), §3.16.3A (equipment-change revalidation contract), §4 and §4.1.4 (equipment-change state-safety clarifications + valid sync/local draft table formatting), §6 (acceptance tests for new behaviors), §9 (Apple/Google sign-in open-decision blocker note), §10.B wording alignment, and this §11 summary.
 - Sections deleted: none.
-- Remaining blockers before production implementation: PRD §0 pre-build gates must pass/sign-off; all §9 open PRD/contract decisions must be closed; migration DDL and RPC implementations must be generated from this contract; and CI integration/e2e must pass §6 acceptance tests.
-- Architecture-freeze readiness remains unmarked while open decisions or implementation artifacts remain incomplete.
-- Confirmation: this patch preserved existing schema/API/RLS/sync/state-machine/acceptance-test detail and only added/amended targeted consistency and implementation-safety content.
+- Remaining blockers before build start: PRD §0 pre-build gates must pass/sign-off; all §9 open PRD/contract decisions must be closed; and applicable content/seed/legal/safety/accessibility ownership blockers must be resolved.
+- Implementation/release validation artifacts (post-build-start, not contract-text blockers): migration DDL generated from this contract, RPC state-transition/idempotency implementation complete, migration-generated policy verification evidence reviewed, and CI integration/e2e passing §6 acceptance tests.
+- Contract-complete status: eligible for engineering estimation and architecture review, but production implementation/release is not marked ready in this revision.
+- Future revision guardrail: all future revisions must patch/add/amend this contract surgically and must not delete, replace, compress, or summarize away detailed schema/API/RLS/trigger/RPC/sync/state-machine/generator/recommendation/acceptance-test sections.
+- Confirmation: this patch preserved existing schema/API/RLS/sync/state-machine/acceptance-test detail and only added/amended targeted readiness wording and anti-deletion safeguards.
