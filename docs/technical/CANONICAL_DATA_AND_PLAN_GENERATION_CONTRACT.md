@@ -1,6 +1,6 @@
 # CANONICAL DATA AND PLAN GENERATION CONTRACT (FINAL MVP BUILD CONTRACT)
 
-**Status:** Draft contract revision; eligible for engineering estimation and architecture review only after §9 open decisions are fully closed and §10.A–§10.B are checked. Architecture-freeze readiness cannot be marked complete while PRD open decisions remain unresolved. Production implementation remains blocked until §10.C.1 (PRD §0 pre-build gates passed and signed off) is true.  
+**Status:** Draft contract revision; eligible for engineering estimation and architecture review only. Architecture-freeze readiness is not complete and cannot be marked complete while the contract §9 open decisions inherited from the PRD / PRD open decisions remain unresolved. Production implementation remains blocked until §10.C.1 (PRD §0 pre-build gates passed and signed off) is true and §10.B is fully complete.  
 **Source of truth:** `PRDv0.6.md`  
 **Revision date:** 2026-05-10
 
@@ -69,6 +69,7 @@ Columns:
 - `experience_level experience_level null`
 - `timezone text not null default 'UTC'`
 - `analytics_opt_out boolean not null default false`
+- `show_rir_field boolean not null default false`
 - `pending_deletion_at timestamptz null`
 - `hard_delete_by timestamptz null`
 - `onboarding_completed_at timestamptz null`
@@ -85,7 +86,7 @@ Ownership/versioning:
 - owner is `user_id`.
 - any mutable update increments `version_token +1`.
 
-API mapping exposed: `bodyWeightUnit`, `experienceLevel`, `analyticsOptOut`, `onboardingCompletedAt`, `versionToken`.
+API mapping exposed: `bodyWeightUnit`, `experienceLevel`, `analyticsOptOut`, `showRirField`, `onboardingCompletedAt`, `versionToken`.
 
 ### 2.2 `goal_plan`
 **Purpose:** User goal and weekly scheduling preferences.
@@ -297,6 +298,8 @@ Columns:
 - `generation_trigger text null` (`manual_regenerate|equipment_change|missed_workout_recovery|schedule_change|focus_change|other` values via check; optional specificity for generation/regeneration trigger)
 - `source_plan_version_id uuid null fk plan_version(id)`
 - `validation_warnings_json jsonb not null default '[]'::jsonb`
+- `plan_explanation_json jsonb not null default '{}'::jsonb`
+- `movement_coverage_summary_json jsonb not null default '{}'::jsonb`
 - `accepted_at timestamptz null`
 - `archived_at timestamptz null`
 - `created_at timestamptz not null default now()`
@@ -340,6 +343,7 @@ Columns:
 - `exercise_catalog_id uuid not null fk exercise_catalog(id)`
 - `sequence_no smallint not null check (sequence_no >= 1)`
 - `notes text null`
+- `selection_reason_json jsonb not null default '{}'::jsonb`
 - `created_at timestamptz not null default now()`
 
 Constraints:
@@ -679,7 +683,9 @@ Load handling:
 - machine/non-comparable load scales: leave load blank.
 MVP forbids carrying load unchanged by default and forbids bilateral→unilateral conversion heuristics unless introduced as explicitly labeled post-MVP/open decision.
 ### 2.A.10 Generator outputs
-Plan-level explanation output schema (`plan_version.validation_warnings_json` companion API field `planExplanation`):
+Persistence contract: generator explanations/reasons are persisted and never API-transient-only. `plan_version.plan_explanation_json`, `plan_version.movement_coverage_summary_json`, and `exercise_instance.selection_reason_json` are required storage for generated outputs and for any future-plan substitution replacement exercise instances.
+
+Plan-level explanation output schema (`plan_version.plan_explanation_json` companion API field `planExplanation`):
 - `templateChosen`
 - `equipmentConstraintsApplied[]`
 - `limitationSuppressions[]`
@@ -690,8 +696,14 @@ Validation warning object schema:
 - `severity enum(info|warning|blocking)`
 - `message text`
 - `slotId text null`
-Movement coverage summary output:
+Movement coverage summary output (`plan_version.movement_coverage_summary_json` companion API field `movementCoverageSummary`):
 - per movement intent: `targetSets`, `assignedSets`, `coverageStatus enum(full|partial|missing)`.
+
+Per-exercise selection reason output (`exercise_instance.selection_reason_json` companion API field `selectionReason`):
+- required keys for every generated exercise instance: `movementIntent`, `prdSlotTaxonomy`, `scoringFactors`, `constraintsApplied`, `fallbackApplied`, `fallbackStatus`, `userFacingExplanation`.
+- `scoringFactors` includes weighted components and tie-break resolution details used for that exercise choice.
+- `constraintsApplied` includes pain/limitation/equipment filters actually applied (or empty list when none).
+- `fallbackStatus` explicitly states whether normal selection, fallback step #, or unfilled-slot pathway was used.
 
 ## 2.B) Progression and Recommendation Rules (PRD-exact precedence/threshold contract)
 
@@ -703,17 +715,17 @@ Movement coverage summary output:
 
 | painLocation | suppressedMuscles | suppressedMovements | substitutionRequiredForEligibleExercises | progressionSuppressed |
 |---|---|---|---|---|
-| shoulder | [chest,shoulders,back_compound_pull,triceps_overhead_loaded] | [horizontal_push,vertical_push,horizontal_pull,vertical_pull] | true | true |
-| elbow | [biceps,triceps,loaded_grip_pull] | [horizontal_pull,vertical_pull,arm_elbow_flexion,arm_elbow_extension] | true | true |
-| wrist | [loaded_pressing,loaded_pulling] | [horizontal_push,vertical_push,horizontal_pull,vertical_pull] | true | true |
-| lower_back | [posterior_chain_loaded,spinal_loading] | [hip_hinge,knee_dominant_squat] | true | true |
-| upper_back | [rows,pull_ups,loaded_carries] | [horizontal_pull,vertical_pull,horizontal_pull] | true | true |
+| shoulder | [chest,shoulders,back_compound_pull,triceps_overhead_loaded] | [horizontal_push,vertical_push] | true | true |
+| elbow | [biceps,triceps,loaded_grip_pull] | [arm_elbow_flexion,arm_elbow_extension] | true | true |
+| wrist | [loaded_pressing,loaded_pulling] | [] | true | true |
+| lower_back | [posterior_chain_loaded,spinal_loading,loaded_standing] | [hip_hinge] | true | true |
+| upper_back | [rows,pull_ups,loaded_carries] | [] | true | true |
 | hip | [squat_pattern,hinge_pattern,lunge_pattern] | [knee_dominant_squat,hip_hinge,single_leg] | true | true |
 | knee | [squat_pattern,lunge_pattern,leg_extension,leg_press] | [knee_dominant_squat,single_leg] | true | true |
-| ankle | [squat_pattern,lunge_pattern,calf] | [knee_dominant_squat,single_leg,calf_plantarflexion] | true | true |
+| ankle | [squat_pattern,lunge_pattern,calf,loaded_standing] | [calf_plantarflexion] | true | true |
 | other | [] | [] | false | false |
 
-Application rules: mapping is applied to exercise eligibility filtering, substitution candidate retrieval, and progression recommendation suppression; `other` does not auto-suppress but emits review prompt.
+Application rules: mapping is applied to exercise eligibility filtering, substitution candidate retrieval, and progression recommendation suppression. Tag-based suppression is authoritative when PRD specifies tags/muscle groups; movement-based suppression is used only where PRD suppresses the whole movement class. `other` does not auto-suppress but emits review prompt.
 
 ### 2.B.2 Load increase threshold
 All conditions required:
@@ -777,25 +789,25 @@ Common:
 - Auth: required
 - Headers: `Idempotency-Key` required
 - Body example: `{ "goalPlanId":"...", "equipmentProfileId":"...", "clientRequestId":"...", "preferredWeekdays":["monday","wednesday","friday"] }`
-- Success `201`: returns draft `planVersion`, nested `workoutDays/exercises/sets`, `validationWarnings`, `versionToken`.
+- Success `201`: returns draft `planVersion`, nested `workoutDays/exercises/sets`, `planExplanation`, `movementCoverageSummary`, per-exercise `selectionReason`, `validationWarnings`, `versionToken`.
 - Idempotency: same user + key + semantically equal body returns same response.
 - Transaction: create `plan_version` + children atomically.
 
 2) `POST /v1/plans/{planVersionId}/accept`
 - Headers: `Idempotency-Key` required
 - Body: `{ "versionToken": 3 }`
-- Success `200`: activated planVersion with incremented token.
+- Success `200`: activated planVersion with incremented token, including `planExplanation`, `movementCoverageSummary`, and nested per-exercise `selectionReason`.
 - Transaction: archive prior active plan (if any), set current active.
 
 3) `POST /v1/plans/{planVersionId}/regenerate`
 - Headers: `Idempotency-Key` required
 - Body: `{ "versionToken": 4, "reason":"regenerate", "generationTrigger":"equipment_change" }`
-- Success `201`: new draft planVersion (new id), prior plan untouched.
+- Success `201`: new draft planVersion (new id), prior plan untouched; response includes `planExplanation`, `movementCoverageSummary`, and nested per-exercise `selectionReason`.
 
 4) `POST /v1/plans/{planVersionId}/revert`
 - Headers: `Idempotency-Key` required
 - Body: `{ "versionToken": 6 }`
-- Success `201`: new active clone with status `reverted`.
+- Success `201`: new active clone with status `reverted`; response includes `planExplanation`, `movementCoverageSummary`, and nested per-exercise `selectionReason`.
 
 ### 3.2 Workout sessions
 5) `POST /v1/workout-sessions/start`
@@ -871,9 +883,12 @@ MVP bounded schema requirement for recommendation explainability fields:
 - Auth: none
 - Headers: `Idempotency-Key` optional
 - Body: onboarding-like fields (goalType, daysPerWeek, preferredWeekdays, sessionLengthMin, equipmentKeys, experienceLevel)
-- Success `200`: transient `samplePlan` only.
+- Success `200`: transient `samplePlan` response plus local-persistence contract metadata `{ localSamplePlanTtlDays:7, localSamplePlanKeyScope:"device_install" }`.
 - Errors: `429` (10 requests/IP/hour), `422` validation.
-- Persistence: no user-owned writes.
+- Persistence: no user-owned backend writes and no email/user-owned record creation before account creation; client saves sample plan locally for 7 days keyed to device/local install only.
+- Reopen behavior: reopening within 7 days MUST show restore prompt text-equivalent to “Save your plan?” and allow restore/discard.
+- Expiry behavior: after 7 days from local save timestamp, local sample plan MUST be discarded and restore prompt MUST NOT be shown.
+- Analytics: only allowlisted `onboarding_abandoned_with_plan` may emit pre-account-creation and payload must exclude prohibited PII/sensitive fields from §8.1.
 
 ### 3.11 Local draft recovery
 24) `POST /v1/sync/local-drafts/recover`
@@ -973,7 +988,7 @@ Conflict handling codes:
 
 #### 3.16.1 User profile / onboarding
 - `PUT /v1/user-profile`
-  - Request: `{ versionToken?: number, birthDate?: date|null, sex?: enum|null, heightCm?: number|null, bodyWeight?: number|null, bodyWeightUnit?: kg|lb|null, experienceLevel?: beginner|intermediate|null, timezone: string, onboardingCompletedAt?: timestamptz|null, analyticsOptOut?: boolean }`
+  - Request: `{ versionToken?: number, birthDate?: date|null, sex?: enum|null, heightCm?: number|null, bodyWeight?: number|null, bodyWeightUnit?: kg|lb|null, experienceLevel?: beginner|intermediate|null, timezone: string, onboardingCompletedAt?: timestamptz|null, analyticsOptOut?: boolean, showRirField?: boolean }`
   - Success: `{ data: { ...userProfile, versionToken:number } }`
   - Errors: `422` invalid ranges/combinations/underage/onboarding-incomplete, `409 VERSION_CONFLICT`, `403` cross-user.
   - Onboarding completion rule: setting `onboardingCompletedAt` requires non-null `bodyWeight`, `bodyWeightUnit`, `heightCm`, (`birthDate` proving age >=18 at save time), `experienceLevel`, active `goalPlan` (`goalType`,`daysPerWeek`,`preferredWeekdays`,`sessionLengthMin`), and active equipment profile with >=1 equipment item.
@@ -1003,8 +1018,8 @@ Conflict handling codes:
   - Success: `{ data:{ candidates:[{ exerciseCatalogId:uuid, score:number, whyThisSubstitution:{ movementIntentMatch:boolean, equipmentCompatible:boolean, painSuppressionApplied:boolean, fatigueComparison:string, historyLoadHint?:string|null } }], suppressedByPainMapping:boolean } }`
 - `POST /v1/substitutions/apply`
   - Request: `{ targetContext:'future_plan'|'session_override', planVersionId:uuid, workoutDayId?:uuid, workoutSessionId?:uuid, exerciseInstanceId:uuid, replacementExerciseCatalogId:uuid, versionToken:number }`
-  - Success: `{ data:{ substitutionId:uuid, mutationType:'replace_future_exercise_instance'|'session_level_override', newExerciseInstanceId?:uuid, preservedOriginalExerciseInstanceId:uuid } }`
-  - Mutation rule: future-plan applies by creating replacement `exercise_instance` row and retiring original from future view; session override writes through `exercise_substitution.session_override_payload` only (no separate `session_exercise_override` entity in MVP). Completed workout history and completed set logs are never rewritten.
+  - Success: `{ data:{ substitutionId:uuid, mutationType:'replace_future_exercise_instance'|'session_level_override', newExerciseInstanceId?:uuid, preservedOriginalExerciseInstanceId:uuid, newExerciseSelectionReason?:object } }`
+  - Mutation rule: future-plan applies by creating replacement `exercise_instance` row (with required `selection_reason_json`) and retiring original from future view; session override writes through `exercise_substitution.session_override_payload` only (no separate `session_exercise_override` entity in MVP). Completed workout history and completed set logs are never rewritten.
 
 #### 3.16.7 Recommendation action ignoredReason other text
 - `POST /v1/recommendations/{id}/ignore` request extends to `{ versionToken:number, ignoredReason:enum, ignoredReasonText?:string|null }`; `ignoredReasonText` required when `ignoredReason='other'`.
@@ -1123,6 +1138,27 @@ FK chain validation examples:
 - same-user wrong chain returns `422 FK_OWNERSHIP_VIOLATION` even when user owns both rows independently.
 
 
+### 5.2 RPC/endpoint error-code matrix (implementation-readiness required)
+For each named RPC and mutable endpoint, contract requires: allowed caller, ownership checks, versionToken requirement, idempotency behavior, transaction boundary, success mutation, and domain errors.
+
+| Operation | Allowed caller | Ownership/FK checks | versionToken | Idempotency | Transaction boundary | Success mutation | Domain errors (in addition to 400/401/404/429/500) |
+|---|---|---|---|---|---|---|---|
+| `rpc_generate_plan` / `POST /v1/plans/generate` | Auth user via API (service executes RPC) | `goal_plan.user_id` + `equipment_profile.user_id` == `auth.uid()` | Not required | Required key; replay returns same plan payload | Single tx create `plan_version`,`workout_day`,`exercise_instance`,`set_prescription` | New draft plan + persisted explanation/coverage/selection reasons | `403 FORBIDDEN_RESOURCE`, `422 FK_OWNERSHIP_VIOLATION`, `422 GENERATION_UNFILLABLE` |
+| `rpc_accept_plan` / `POST /v1/plans/{id}/accept` | Auth user | plan ownership + active-plan constraints | Required exact | Required key; safe replay | Single tx archive prior active + activate target | Plan status/token update only | `403 FORBIDDEN_RESOURCE`, `409 VERSION_CONFLICT`, `422 INVALID_STATE_TRANSITION` |
+| `rpc_regenerate_plan` / `POST /v1/plans/{id}/regenerate` | Auth user | source plan ownership | Required exact source token | Required key; replay returns created plan | Single tx new plan tree create | New draft plan row/tree persisted | `403`, `409 VERSION_CONFLICT`, `422 GENERATION_UNFILLABLE` |
+| `rpc_revert_plan` / `POST /v1/plans/{id}/revert` | Auth user | source plan ownership | Required exact source token | Required key | Single tx clone source + activate reverted clone | New reverted-active plan row/tree | `403`, `409 VERSION_CONFLICT`, `422 INVALID_REVERT_SOURCE` |
+| `rpc_transition_workout_session` / §3.2 mutators | Auth user | session ownership + status transition validity | Required exact | Required key for all mutators; replay same transition | Single-session state tx | session status/timestamps/token | `403`, `409 VERSION_CONFLICT`, `422 INVALID_STATE_TRANSITION` |
+| `rpc_append_set_logs` / `POST .../set-logs` | Auth user | session/exercise/set chain ownership | Required exact | Required key + `clientMutationId` dedupe | Append tx for all entries | new set_log rows + session token bump | `403`, `409 VERSION_CONFLICT`, `422 FK_OWNERSHIP_VIOLATION`, `422 SET_LOG_SCHEMA_INVALID` |
+| `rpc_upsert_post_workout_check_in` / `PUT .../post-workout-check-in` | Auth user | session ownership + session mutability | Required exact | Required key; same payload replay safe | Upsert tx per session | check-in upsert + token bump | `403`, `409 VERSION_CONFLICT`, `422 CHECKIN_SCHEMA_INVALID`, `422 INVALID_STATE_TRANSITION` |
+| `rpc_apply_recommendation_action` / §3.8 mutators | Auth user | recommendation ownership + pending status rules | Required exact | Required key; replay safe | Single-row update tx | recommendation status + ignored fields | `403`, `409 VERSION_CONFLICT`, `422 INVALID_RECOMMENDATION_ACTION` |
+| `rpc_apply_substitution` / `POST /v1/substitutions/apply` | Auth user | plan/day/session/exercise chain ownership | Required exact (`plan_version` or `workout_session`) | Required key scoped as §5.1 | Single tx; future_plan path creates replacement exercise+sets | substitution row + optional replacement exercise instance with `selection_reason_json` | `403`, `409 VERSION_CONFLICT`, `422 FK_OWNERSHIP_VIOLATION`, `422 INVALID_SUBSTITUTION_TARGET`, `422 PAIN_SUPPRESSION_CONFLICT` |
+| `rpc_add_equipment_item` / `POST .../items` | Auth user | profile ownership + active key exists | Required exact parent token | Required key; replay returns existing row | Single tx insert item + bump parent token | equipment item create | `403`, `409 VERSION_CONFLICT`, `422 INVALID_EQUIPMENT_KEY`, `422 DUPLICATE_EQUIPMENT_ITEM` |
+| `rpc_remove_equipment_item` / `DELETE .../items/{itemId}` | Auth user | profile/item ownership chain | Required exact parent token | Required key; replay acknowledged | Single tx delete/archive item + bump token | equipment item deletion effect | `403`, `409 VERSION_CONFLICT`, `422 FK_OWNERSHIP_VIOLATION`, `422 MIN_EQUIPMENT_VIOLATION` |
+| `rpc_recover_local_draft` / `POST /v1/sync/local-drafts/recover` | Auth user | ownership and plan/day/session chain per recovery path | Required when attaching to existing mutable session | Required key | Single recovery tx (create or attach path) | session recovered + set-log replay | `403`, `409 STALE_VERSION_TOKEN`, `409 SESSION_ALREADY_COMPLETED`, `422 PLAN_VERSION_MISMATCH`, `422 WORKOUT_DAY_MISMATCH` |
+| `rpc_upsert_trust_survey_response` / `POST /v1/trust-survey` | Auth user | row ownership by `(user_id,week_index)` | Required exact (as §3.12) | Required key | Upsert tx | trust row insert/update + token bump | `403`, `409 VERSION_CONFLICT`, `422 TRUST_SURVEY_SCHEMA_INVALID` |
+
+Migration-generated policy verification evidence remains a later implementation-readiness deliverable in §10.C and is not marked complete in this contract revision.
+
 ---
 
 ## 6) Acceptance tests mapped to risk
@@ -1150,6 +1186,13 @@ Must-pass tests:
 
 20. Movement-intent domain enforcement: `exercise_catalog.movement_intents` and pain suppression `suppressedMovements` reject values outside canonical `movement_intent` enum.
 21. Hard disqualifier semantics: disliked is scored penalty (not filtered), pain/limitations hard-filter, experience-level filter relaxes only through fallback when alternatives absent.
+22. Generator reason persistence: generated plan persists non-empty `plan_explanation_json` and `movement_coverage_summary_json`; every generated `exercise_instance` persists non-empty `selection_reason_json` with required keys.
+23. Plan responses: generate/accept/regenerate/revert responses include `planExplanation`, `movementCoverageSummary`, and per-exercise `selectionReason` mapped from persisted DB fields.
+24. Future-plan substitution reason persistence: applying future-plan substitution creates replacement `exercise_instance` whose `selection_reason_json` is populated and returned as `newExerciseSelectionReason`.
+25. Onboarding-abandoned local sample plan restore-before-expiry: reopen same device/install within 7 days shows “Save your plan?” restore prompt and restores local sample plan without backend user-owned writes.
+26. Onboarding-abandoned local sample plan discard-after-expiry: after >7 days, local sample plan is discarded and restore prompt is not shown.
+27. Profile RIR toggle persistence: `show_rir_field` defaults false, PATCH/PUT profile updates return `showRirField`, and concurrent writes enforce `409 VERSION_CONFLICT`.
+28. Pain suppression mapping precision: shoulder suppresses back compounds via tags (not blanket horizontal/vertical pull movement suppression); lower_back and ankle suppression include `loaded_standing`; `other` suppresses nothing.
 ### 6.1 Concrete Given/When/Then acceptance tests
  Concrete Given/When/Then acceptance tests
 - Given two same-day slots and identical top candidate, when generator assigns slot2, then cross-slot exclusion picks next candidate.
@@ -1253,7 +1296,7 @@ Blocking decisions outside this contract (if unresolved in PRD) must remain flag
 ### B) Architecture-freeze ready
 - [ ] RLS/FK/trigger/RPC enforcement finalized with explicit per-table permissions and domain errors (still missing: finalized per-endpoint RPC error-code matrix sign-off and migration-generated policy verification evidence).
 - [x] Acceptance tests mapped to high-risk flows and invariants.
-- [ ] All §9 PRD open decisions closed (required before architecture-freeze can be marked complete).
+- [ ] All contract §9 open decisions inherited from the PRD / PRD open decisions closed (required before architecture-freeze can be marked complete).
 - [x] PRD open decisions explicitly listed as blockers while unresolved.
 
 ### C) Production implementation ready
@@ -1265,7 +1308,7 @@ Blocking decisions outside this contract (if unresolved in PRD) must remain flag
 
 
 ## 11) Patch Summary
-- Sections patched: §2.A.2, §2.A.3, §2.A.4, §2.A.6, §2.A.7, §2.A.9, §2.10, §3.1, §10.B, and PRD-exact labeling language in affected subsections.
+- Sections patched: §Status line, §2.1, §2.10, §2.12, §2.A.10, §2.B.1.A, §3.1, §3.10, §3.14.2, §3.16.1, §3.16.6, §5.2, §6, §10.B, and this §11 summary.
 - Sections deleted: none.
 - Remaining blockers before production implementation: PRD §0 pre-build gates must pass/sign-off; all §9 open PRD decisions must be closed; migration DDL and RPC implementations must be generated from this contract; CI integration/e2e must pass §6 acceptance tests; and §10.B architecture-freeze checklist items must be complete.
 - Confirmation: no schema/API/RLS/sync/state-machine/acceptance-test detail was removed or compressed; edits are surgical consistency patches within affected subsections only.
