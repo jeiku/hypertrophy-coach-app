@@ -971,7 +971,9 @@ Recovery path A (existing workoutSessionId):
 4) return `duplicateClientMutationIds[]` and accepted IDs.
 
 Recovery path B (creation context before first sync):
-1) create session from `planVersionId+workoutDayId+scheduledForDate(derived)` in transaction.
+1) `scheduledForDate` is required when `workoutSessionId` is null; server interprets date in `user_profile.timezone` and persists canonical UTC boundaries accordingly.
+2) if `workoutSessionId` is provided and `scheduledForDate` is also provided, `scheduledForDate` MUST equal existing `workout_session.scheduled_for_date`; mismatch returns `409 LOCAL_DRAFT_SCHEDULED_DATE_CONFLICT` with deterministic payload `{ expectedScheduledForDate, providedScheduledForDate }`.
+3) create session from `planVersionId+workoutDayId+scheduledForDate` in transaction using uniqueness guard `(user_id, workout_day_id, scheduled_for_date)` to prevent duplicate session creation during recovery replay.
 2) insert recovered set logs/check-in snapshot.
 3) return created `workoutSessionId` and server `versionToken`.
 
@@ -982,35 +984,71 @@ Conflict handling codes:
 - `STALE_VERSION_TOKEN`: reject with `currentVersionToken`.
 - `DUPLICATE_CLIENT_MUTATION_ID`: non-fatal replay list in success payload.
 - `PARTIAL_SYNC_CONFLICT`: return merged summary + unresolved item list.
+- `LOCAL_DRAFT_SCHEDULED_DATE_CONFLICT`: deterministic mismatch error for creation-context payload vs existing session date.
 
 ### 3.16 Missing MVP endpoint contracts
  (authoritative supplement to §3)
 
 #### 3.16.1 User profile / onboarding
 - `PUT /v1/user-profile`
+  - Auth: required; owner row only.
+  - Headers: `Authorization`, `Content-Type: application/json`, `Idempotency-Key`.
   - Request: `{ versionToken?: number, birthDate?: date|null, sex?: enum|null, heightCm?: number|null, bodyWeight?: number|null, bodyWeightUnit?: kg|lb|null, experienceLevel?: beginner|intermediate|null, timezone: string, onboardingCompletedAt?: timestamptz|null, analyticsOptOut?: boolean, showRirField?: boolean }`
   - Success: `{ data: { ...userProfile, versionToken:number } }`
-  - Errors: `422` invalid ranges/combinations/underage/onboarding-incomplete, `409 VERSION_CONFLICT`, `403` cross-user.
+  - Errors: `400 INVALID_JSON`, `401 UNAUTHORIZED`, `403 FORBIDDEN_RESOURCE`, `409 VERSION_CONFLICT`, `422 VALIDATION_ERROR|UNDERAGE_NOT_ALLOWED|ONBOARDING_INCOMPLETE_REQUIREMENTS`, `429 RATE_LIMITED`.
   - Onboarding completion rule: setting `onboardingCompletedAt` requires non-null `bodyWeight`, `bodyWeightUnit`, `heightCm`, (`birthDate` proving age >=18 at save time), `experienceLevel`, active `goalPlan` (`goalType`,`daysPerWeek`,`preferredWeekdays`,`sessionLengthMin`), and active equipment profile with >=1 equipment item.
   - Age gate: server rejects under-18 users at onboarding completion and account-save with `422 UNDERAGE_NOT_ALLOWED`; `birthDate` may remain null only while onboarding draft is incomplete. Sex remains optional in MVP.
   - Idempotency/versioning: requires `Idempotency-Key`; create path may omit versionToken, update path requires exact current token.
+  - Transaction notes: single-row upsert on `user_profile`; if onboarding completion requested, server validates goal/equipment preconditions in same transaction snapshot.
   - RLS: only `user_profile.user_id=auth.uid()` row.
 
 #### 3.16.2 Goal plan CRUD
 - `POST /v1/goal-plans`, `PATCH /v1/goal-plans/{id}` with strict fields from §2.2.
+- `POST /v1/goal-plans`
+  - Auth/headers: auth required + `Idempotency-Key`.
+  - Request: `{ goalType, daysPerWeek, preferredWeekdays[], sessionLengthMin, focusMuscles?:string[], isActive?:boolean }`.
+  - Success `201`: `{ data:{ id, userId, goalType, daysPerWeek, preferredWeekdays, sessionLengthMin, focusMuscles, isActive, versionToken:1 } }`.
+  - Errors: `409 ACTIVE_GOAL_ALREADY_EXISTS` (if `isActive=true` and no archive flag path), `422 INVALID_WEEKDAY_CARDINALITY|INVALID_RANGE`, `403 FORBIDDEN_RESOURCE`.
+  - Idempotency: key+body replay returns same created row.
+- `PATCH /v1/goal-plans/{id}`
+  - Request: `{ versionToken:number, goalType?, daysPerWeek?, preferredWeekdays?, sessionLengthMin?, focusMuscles?, isActive? }`.
+  - Success `200`: updated row + incremented `versionToken`.
+  - Errors: `404 GOAL_PLAN_NOT_FOUND`, `409 VERSION_CONFLICT`, `422 INVALID_WEEKDAY_CARDINALITY|INVALID_RANGE`.
+  - Idempotency/versionToken: `Idempotency-Key` required; stale token rejected.
 - Active-goal uniqueness enforced transactionally; update/archive prior active in same transaction.
+- Transaction/RLS: `user_id=auth.uid()` enforced; toggling active state archives previous active goal in same transaction.
 
 #### 3.16.3 Equipment profile and items
 - `POST /v1/equipment-profiles`, `PATCH /v1/equipment-profiles/{id}`, `DELETE /v1/equipment-profiles/{id}` (soft-delete/archive only if referenced).
 - `POST /v1/equipment-profiles/{id}/items` request `{ equipmentProfileVersionToken:number, equipmentKey:string }`.
 - Delete item endpoint in §3.9 remains authoritative; add endpoint follows same parent token bump semantics.
+- `POST /v1/equipment-profiles`: auth + `Idempotency-Key`; success `201` with `versionToken:1`; active uniqueness transaction identical to goal-plan rule.
+- `PATCH /v1/equipment-profiles/{id}`: requires `{ versionToken:number, name?:string, isActive?:boolean }`; success `200` token+1; errors `409 VERSION_CONFLICT`, `422 INVALID_NAME`.
+- `DELETE /v1/equipment-profiles/{id}`: requires `{ versionToken:number }`; success `200` archived profile token+1; returns `409 PROFILE_IN_USE` if internal hard-delete requested while referenced.
+- `POST /v1/equipment-profiles/{id}/items`
+  - Headers: `Idempotency-Key` required.
+  - Request: `{ equipmentProfileVersionToken:number, equipmentKey:string }`.
+  - Success `201`: `{ data:{ itemId, equipmentProfileId, equipmentKey, equipmentProfileVersionToken:number } }` (parent token increments exactly +1).
+  - Errors: `404 EQUIPMENT_PROFILE_NOT_FOUND`, `409 VERSION_CONFLICT|DUPLICATE_EQUIPMENT_ITEM`, `422 INVALID_EQUIPMENT_KEY|FK_OWNERSHIP_VIOLATION`.
+  - Transaction/RLS: insert item + parent token bump atomic; parent `user_id` ownership validated.
 
 #### 3.16.4 Exercise catalog read APIs
 - `GET /v1/exercises?movementIntent=&equipmentKey=&limit=&cursor=` and `GET /v1/exercises/{id}`.
 - Read-only through API proxy to seed tables; direct client table access is allowed only read (`is_active=true`) under RLS.
+- `GET /v1/exercises`
+  - Auth: required in app flow (public unauth read is non-MVP/internal only).
+  - Request query: `movementIntent?`, `equipmentKey?`, `limit(1..100, default 25)`, `cursor?`.
+  - Success `200`: `{ data:{ items:[...exerciseCatalogProjection], nextCursor?:string|null } }`.
+  - Errors: `422 INVALID_QUERY_PARAM`.
+- `GET /v1/exercises/{id}`
+  - Success `200`: single active exercise projection; `404 EXERCISE_NOT_FOUND` when missing/inactive.
 
 #### 3.16.5 Exercise preference CRUD
 - `POST /v1/exercise-preferences`, `PATCH /v1/exercise-preferences/{id}`, `DELETE /v1/exercise-preferences/{id}` using §2.7 schema and versionToken for patch/delete.
+- `POST /v1/exercise-preferences`: headers include `Idempotency-Key`; request `{ exerciseCatalogId, preferenceType, notes? }`; success `201` versionToken=1; errors `409 DUPLICATE_PREFERENCE`, `422 INVALID_PREFERENCE`.
+- `PATCH /v1/exercise-preferences/{id}`: request `{ versionToken, preferenceType?, notes? }`; success `200` token+1; errors `409 VERSION_CONFLICT`, `404 NOT_FOUND`.
+- `DELETE /v1/exercise-preferences/{id}`: request `{ versionToken }`; success `200` tombstone ack; idempotent replay returns same ack; errors `409 VERSION_CONFLICT`.
+- RLS/transaction: each mutation scoped to `user_id=auth.uid()`; no cross-user exercise preference reads/writes.
 
 #### 3.16.6 Substitution candidates + apply
 - `POST /v1/substitutions/candidates`
@@ -1020,11 +1058,25 @@ Conflict handling codes:
   - Request: `{ targetContext:'future_plan'|'session_override', planVersionId:uuid, workoutDayId?:uuid, workoutSessionId?:uuid, exerciseInstanceId:uuid, replacementExerciseCatalogId:uuid, versionToken:number }`
   - Success: `{ data:{ substitutionId:uuid, mutationType:'replace_future_exercise_instance'|'session_level_override', newExerciseInstanceId?:uuid, preservedOriginalExerciseInstanceId:uuid, newExerciseSelectionReason?:object } }`
   - Mutation rule: future-plan applies by creating replacement `exercise_instance` row (with required `selection_reason_json`) and retiring original from future view; session override writes through `exercise_substitution.session_override_payload` only (no separate `session_exercise_override` entity in MVP). Completed workout history and completed set logs are never rewritten.
+  - Headers/auth: both substitution endpoints require auth + `Idempotency-Key`.
+  - Errors (both): `404 TARGET_NOT_FOUND`, `409 VERSION_CONFLICT|INVALID_STATE_TRANSITION`, `422 INVALID_SUBSTITUTION_CONTEXT|FK_OWNERSHIP_VIOLATION`.
+  - VersionToken: required and validated against plan/session context selected by `context/targetContext`.
+  - Transaction notes: candidate computation is read-only snapshot; apply is atomic write transaction touching only allowed target context rows.
 
 #### 3.16.7 Recommendation action ignoredReason other text
 - `POST /v1/recommendations/{id}/ignore` request extends to `{ versionToken:number, ignoredReason:enum, ignoredReasonText?:string|null }`; `ignoredReasonText` required when `ignoredReason='other'`.
+- Additional validation: if `ignoredReason!='other'`, `ignoredReasonText` must be null/omitted else `422 IGNORED_REASON_TEXT_NOT_ALLOWED`.
+- Idempotency/versioning: `Idempotency-Key` required; duplicate request replays prior state transition response, stale version token returns `409 VERSION_CONFLICT`.
 
-#### 3.16.8 Transaction/RPC notes for endpoint groups
+#### 3.16.8 Account deletion status/read endpoint
+- `GET /v1/account/deletion-status`
+  - Purpose: allow app to read deletion pending status after deletion-request path blocks general data APIs.
+  - Auth: required.
+  - Success `200`: `{ data:{ pendingDeletionAt:timestamptz|null, hardDeleteBy:timestamptz|null, deletionState:'none'|'pending'|'scheduled_hard_delete' } }`.
+  - Errors: `401 UNAUTHORIZED` only; endpoint bypasses pending-deletion write/read block by explicit policy exception.
+  - VersionToken/idempotency: read-only endpoint; no token/header requirement.
+
+#### 3.16.9 Transaction/RPC notes for endpoint groups
 - Workout-session status transitions are RPC-only (`rpc_transition_workout_session`).
 - Recommendation accept/ignore/dismiss are RPC-only (`rpc_apply_recommendation_action`).
 - Set logs are append/idempotent insert only via RPC (`rpc_append_set_logs`); no client update/delete contract.
@@ -1052,6 +1104,43 @@ Hard guarantees:
 3. Unsynced drafts block destructive regeneration/equipment change until user choice recorded.
 4. Same-day `not_started` behavior explicit: default keep unless explicit replace.
 5. Regeneration always creates new `plan_version` rows.
+
+### 4.1 Explicit transition tables (authoritative state-machine supplement)
+
+#### 4.1.1 PlanVersion transitions
+| Source | Target | Trigger | versionToken | Idempotency | Invalid transition |
+|---|---|---|---|---|---|
+| draft | active | `POST /v1/plans/{id}/accept` | required | required (`Idempotency-Key`) | `422 INVALID_STATE_TRANSITION` |
+| active | archived | implicit inside accept/regenerate/revert transaction | required on initiating endpoint | inherited from initiating endpoint | `422 INVALID_STATE_TRANSITION` |
+| active | reverted (new clone row) | `POST /v1/plans/{id}/revert` | required | required | `422 INVALID_STATE_TRANSITION` |
+| active/draft | draft (new row) | `POST /v1/plans/{id}/regenerate` | required | required | `422 INVALID_STATE_TRANSITION` |
+
+#### 4.1.2 WorkoutSession transitions
+| Source | Target | Trigger endpoint/RPC | versionToken | Idempotency | Invalid transition |
+|---|---|---|---|---|---|
+| not_started | in_progress | `POST /v1/workout-sessions/start` or `/resume` via `rpc_transition_workout_session` | start: none, resume: required | required | `422 INVALID_STATE_TRANSITION` |
+| in_progress | completed | `POST /v1/workout-sessions/{id}/finish` | required | required | `422 INVALID_STATE_TRANSITION` |
+| in_progress | partial | `POST /v1/workout-sessions/{id}/mark-partial` | required | required | `422 INVALID_STATE_TRANSITION` |
+| not_started/in_progress | skipped | `POST /v1/workout-sessions/{id}/skip` | required | required | `422 INVALID_STATE_TRANSITION` |
+| not_started/in_progress | completed_outside_app | `POST /v1/workout-sessions/{id}/complete-outside-app` | required | required | `422 INVALID_STATE_TRANSITION` |
+| in_progress | abandoned | internal-only non-MVP automation/timeout path (no public endpoint) | internal token check | internal idempotency | `422 INVALID_STATE_TRANSITION` |
+| any non-deleted | deleted | internal-only non-MVP retention/admin path (no public endpoint) | internal token check | internal idempotency | `422 INVALID_STATE_TRANSITION` |
+
+#### 4.1.3 Recommendation transitions
+| Source | Target | Trigger | versionToken | Idempotency | Invalid transition |
+|---|---|---|---|---|---|
+| pending | accepted | `POST /v1/recommendations/{id}/accept` via `rpc_apply_recommendation_action` | required | required | `422 INVALID_STATE_TRANSITION` |
+| pending | ignored | `POST /v1/recommendations/{id}/ignore` | required | required | `422 INVALID_STATE_TRANSITION` |
+| pending | dismissed | `POST /v1/recommendations/{id}/dismiss` | required | required | `422 INVALID_STATE_TRANSITION` |
+| pending | expired | internal scheduler only (no public endpoint) | n/a | n/a | `422 INVALID_STATE_TRANSITION` |
+
+#### 4.1.4 Sync/local draft transitions
+| Source | Target | Trigger | versionToken | Idempotency | Invalid transition |
+|---|---|---|---|---|---|
+| not_synced | partially_synced | `POST /v1/sync/local-drafts/recover` with partial apply | session token required if session exists | required | `409 PARTIAL_SYNC_CONFLICT` |
+| not_synced/partially_synced | synced | `POST /v1/sync/local-drafts/recover` full apply | required when session exists | required | `409 STALE_VERSION_TOKEN` |
+| not_synced/partially_synced | conflicted | server conflict detection during recover | required when session exists | required | `409 PLAN_VERSION_MISMATCH|WORKOUT_DAY_MISMATCH|LOCAL_DRAFT_SCHEDULED_DATE_CONFLICT` |
+| conflicted | synced | client retries recover with corrected payload | required | required | `409 PARTIAL_SYNC_CONFLICT` |
 
 ---
 
