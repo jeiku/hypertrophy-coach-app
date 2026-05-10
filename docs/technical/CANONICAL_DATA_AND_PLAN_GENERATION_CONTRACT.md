@@ -1,6 +1,6 @@
 # CANONICAL DATA AND PLAN GENERATION CONTRACT
 
-**Status:** Implementation Freeze - Build Ready (Final blocker patch applied; explicit draft-protection, sequencing, session-scoped substitutions, and seed gate criteria satisfied)  
+**Status:** Implementation Freeze - Blockers Resolved in Contract (Pending implementation)  
 **Source of truth:** `PRD.md` v0.4 Canonical Draft  
 **Revision date:** 2026-05-10
 
@@ -192,11 +192,34 @@ Constraints: unique `(exercise_instance_id, set_index) where deleted_at is null`
 - `deleted_at timestamptz null`
 Constraints: unique `(user_id, scheduled_for_date, workout_day_id) where deleted_at is null and status <> 'deleted'`.
 
-## 2.11 `set_log`
+## 2.11 `workout_session_exercise`
+- `id uuid pk`
+- `user_id uuid not null references auth.users(id)`
+- `workout_session_id uuid not null references workout_session(id)`
+- `source_exercise_instance_id uuid not null references exercise_instance(id)`
+- `replacement_exercise_id uuid not null references exercise_catalog(id)`
+- `movement_intent movement_intent not null`
+- `substitution_group_id uuid not null`
+- `reason_code text null`
+- `slot_index int not null`
+- `client_substitution_id uuid null`
+- `version int not null default 1`
+- `deleted_at timestamptz null`
+- `created_at timestamptz not null default now()`
+- `updated_at timestamptz not null default now()`
+Constraints:
+- unique `(workout_session_id, source_exercise_instance_id, substitution_group_id) where deleted_at is null`
+- unique `(user_id, client_substitution_id) where client_substitution_id is not null`
+- ownership-chain validation trigger: `workout_session_exercise.user_id = workout_session.user_id`
+- `source_exercise_instance_id` must belong to the same `workout_day_id` as `workout_session.workout_day_id` (validated by `fn_validate_workout_session_exercise_links()`).
+- `replacement_exercise_id` must reference an active `exercise_catalog` row (`is_active=true`) validated by trigger/check function.
+
+## 2.12 `set_log`
 - `id uuid pk`
 - `workout_session_id uuid not null references workout_session(id)`
 - `user_id uuid not null references auth.users(id)`
-- `exercise_instance_id uuid not null references exercise_instance(id)`
+- `exercise_instance_id uuid null references exercise_instance(id)`
+- `workout_session_exercise_id uuid null references workout_session_exercise(id)`
 - `set_prescription_id uuid null references set_prescription(id)`
 - `set_source set_source not null`
 - `set_index int not null check (set_index >= 1)`
@@ -210,15 +233,24 @@ Constraints: unique `(user_id, scheduled_for_date, workout_day_id) where deleted
 - `version int not null default 1`
 - `deleted_at timestamptz null`
 Rules:
-- Prescribed set: `set_source='prescribed'` requires non-null `set_prescription_id`.
-- Added set: `set_source='added'` requires `set_prescription_id is null`.
-- unique `(workout_session_id, set_prescription_id) where set_prescription_id is not null and deleted_at is null`.
-- unique `(workout_session_id, exercise_instance_id, set_index, set_source) where deleted_at is null`.
-- unique `(user_id, client_set_log_id) where client_set_log_id is not null`.
+- Exactly one exercise link is required: `(exercise_instance_id is null) <> (workout_session_exercise_id is null)`.
+- Planned prescribed set: `exercise_instance_id` non-null, `workout_session_exercise_id` null, `set_source='prescribed'`, `set_prescription_id` non-null.
+- Planned added set: `exercise_instance_id` non-null, `workout_session_exercise_id` null, `set_source='added'`, `set_prescription_id` null.
+- Substituted prescribed-style set: `workout_session_exercise_id` non-null, `exercise_instance_id` null, `set_source='prescribed'`, `set_prescription_id` may be null (target sets are virtual unless explicitly materialized in a future non-MVP revision).
+- Substituted added set: `workout_session_exercise_id` non-null, `exercise_instance_id` null, `set_source='added'`, `set_prescription_id` null.
+- If `set_prescription_id` is present, it must belong to the source planned `exercise_instance` for the same workout day/session.
+- Substitution must never mutate `exercise_instance`, `workout_day`, `plan_version`, or completed history.
+Constraints:
+- unique `(workout_session_id, set_prescription_id) where set_prescription_id is not null and deleted_at is null`
+- unique `(workout_session_id, exercise_instance_id, set_index, set_source) where exercise_instance_id is not null and deleted_at is null`
+- unique `(workout_session_id, workout_session_exercise_id, set_index, set_source) where workout_session_exercise_id is not null and deleted_at is null`
+- unique `(user_id, client_set_log_id) where client_set_log_id is not null`
+Validation function:
+- `fn_validate_set_log_links()` validates same-user ownership across `workout_session`, `exercise_instance`, `workout_session_exercise`, and `set_log`; exactly-one-link rule; workout-day/session alignment; and prescription alignment. Violations raise SQLSTATE `23514` mapped to API `FOREIGN_LINK_CONFLICT`.
 Skipped sets: `state='skipped'`, keep row immutable except audit fields.
 Deleted sets: `state='deleted'` + `deleted_at` populated (soft delete).
 
-## 2.12 `body_weight_log`
+## 2.13 `body_weight_log`
 - `id uuid pk`
 - `user_id uuid not null references auth.users(id)`
 - `logged_on date not null`
@@ -239,7 +271,7 @@ Weekly trend:
 - `weekly_avg_kg = avg(weight_kg)` over rows where `logged_on between current_date-6 and current_date`, excluding deleted.
 - `weekly_trend_kg = weekly_avg_kg(current 7 days) - weekly_avg_kg(previous 7 days)`.
 
-## 2.13 `food_log`
+## 2.14 `food_log`
 - `id uuid pk`
 - `user_id uuid not null references auth.users(id)`
 - `logged_on date not null`
@@ -254,7 +286,7 @@ Weekly trend:
 - `version int not null default 1`
 - `deleted_at timestamptz null`
 
-## 2.14 `saved_meal`
+## 2.15 `saved_meal`
 - `id uuid pk`
 - `user_id uuid not null references auth.users(id)`
 - `name text not null`
@@ -312,7 +344,7 @@ Unique: `(user_id, lower(name)) where deleted_at is null`.
 Constraints: one active preference per user (`user_id` unique where `deleted_at is null`).
 
 
-## 2.18 `exercise_catalog`
+## 2.19 `exercise_catalog`
 - `id uuid pk` (deterministic seed IDs)
 - `slug text not null unique`
 - `name text not null`
@@ -333,7 +365,7 @@ Constraints: one active preference per user (`user_id` unique where `deleted_at 
 - `is_active boolean not null default true`
 Constraints: unique `(slug)` and seed row count acceptance test `= 50 active canonical rows`.
 
-## 2.19 `user_exercise_preference`
+## 2.20 `user_exercise_preference`
 - `id uuid pk`
 - `user_id uuid not null references auth.users(id)`
 - `exercise_id uuid not null references exercise_catalog(id)`
@@ -345,7 +377,7 @@ Constraints: unique `(slug)` and seed row count acceptance test `= 50 active can
 Constraints: unique `(user_id, exercise_id) where deleted_at is null`.
 Generator preference interpretation is defined in §6.10 deterministic scoring (single source of truth); do not apply additional implicit weights.
 
-## 2.20 `user_limitation`
+## 2.21 `user_limitation`
 - `id uuid pk`
 - `user_id uuid not null references auth.users(id)`
 - `limitation_type limitation_type not null`
@@ -364,16 +396,26 @@ Generator preference interpretation is defined in §6.10 deterministic scoring (
 ## 3) RLS policies (table-by-table)
 Assume helper function `auth.uid()` and service role bypass.
 
-- `user_profile`, `goal_plan`, `equipment_profile`, `equipment_profile_item`, `equipment_calendar_entry`, `body_weight_log`, `food_log`, `saved_meal`, `user_limitation`, `post_workout_check_in`, `notification_preference`: `USING (user_id = auth.uid())`, `WITH CHECK (user_id = auth.uid())`.
-- `plan_version`, `workout_day`, `exercise_instance`, `set_prescription`, `workout_session`, `set_log`, `recommendation`: client role **read-own only**; writes denied, backend service performs writes.
+Client-owned read/write (`USING (user_id = auth.uid())`, `WITH CHECK (user_id = auth.uid())`):
+- `user_profile`, `goal_plan`, `equipment_profile`, `equipment_profile_item`, `equipment_calendar_entry`, `training_schedule_entry`, `body_weight_log`, `food_log`, `saved_meal`, `user_limitation`, `post_workout_check_in`, `notification_preference`, `user_exercise_preference`.
+- `training_schedule_entry` additionally enforces ownership trigger `training_schedule_entry.user_id = goal_plan.user_id`.
+
+Read-own / service-write tables:
+- `plan_version`, `workout_day`, `exercise_instance`, `set_prescription`, `workout_session`, `set_log`, `workout_session_exercise`, `recommendation`.
+- Client role has SELECT-only own rows; direct INSERT/UPDATE/DELETE denied. Backend/service endpoints perform writes.
 
 Ownership-chain read policies:
-- `workout_day`: exists plan_version where `plan_version.id = workout_day.plan_version_id and plan_version.user_id=auth.uid()`.
-- `exercise_instance`: exists workout_day owned by user.
-- `set_prescription`: exists exercise_instance owned by user.
-- `set_log`: exists workout_session owned by user and exercise_instance owned by user.
+- `workout_day`: exists `plan_version` where `plan_version.id = workout_day.plan_version_id and plan_version.user_id = auth.uid()`.
+- `exercise_instance`: exists owned `workout_day`.
+- `set_prescription`: exists owned `exercise_instance`.
+- `workout_session_exercise`: exists `workout_session` where `workout_session.id = workout_session_exercise.workout_session_id and workout_session.user_id = auth.uid()`.
+- `set_log`: exists owned `workout_session` and (`exercise_instance_id` path owned OR `workout_session_exercise_id` path owned).
 
-Cross-user denial acceptance criteria: any user B select/update on user A row returns zero rows / forbidden.
+Catalog and ledger special policies:
+- `exercise_catalog`: authenticated clients can `SELECT` only rows where `is_active=true`; no client INSERT/UPDATE/DELETE; service/backend manages seed/catalog writes.
+- `processed_mutation`, `workout_session_mutation`: no direct client read/write; service role only.
+
+Cross-user denial acceptance criteria: any user B select/update/insert/link attempt against user A data returns zero rows / forbidden.
 
 ---
 
@@ -400,7 +442,6 @@ Constraints: unique `(user_id, mutation_id)`.
 - `mutation_hash text not null`
 - `client_timestamp timestamptz not null`
 - `client_sequence int null`
-- `last_applied_seq int null`
 - `endpoint_scope text not null`
 - `request_body jsonb not null`
 - `response_status int not null`
@@ -414,7 +455,7 @@ Rules (both ledgers where applicable):
 - Same mutation id + same mutation hash => replay stored response/status.
 - Same mutation id + different hash => `409 MUTATION_ID_REUSE_CONFLICT`.
 - Stale `ifMatchVersion` => `409 VERSION_CONFLICT`.
-- Out-of-order local draft sequence (`client_sequence <= last_applied_seq`) => `409 MUTATION_SEQUENCE_CONFLICT`.
+- Out-of-order or gap sequence is validated against `workout_session.last_applied_client_sequence` and returns `409 MUTATION_SEQUENCE_CONFLICT`.
 
 ---
 
@@ -423,7 +464,7 @@ All write requests include: `mutationId`, `clientTimestamp`, optional `clientReq
 
 ### 5.1 Onboarding/profile
 - `PUT /v1/profile` -> `{data:{profile,version}}`
-- `POST /v1/onboarding/complete` -> `{data:{completedAt,profileVersion,goalPlanId,equipmentProfileId}}`
+- `POST /v1/onboarding/complete` accepts required `initialWeightValue, initialWeightUnit, initialWeightLoggedOn, timezone` and creates in one transaction: `user_profile`, `goal_plan`, `equipment_profile`, `equipment_profile_item`, `training_schedule_entry`, `equipment_calendar_entry`, first `body_weight_log`, and initial `plan_version` only when generation preconditions are satisfied. Response `{data:{completedAt,profileVersion,goalPlanId,equipmentProfileId,bodyWeightLogId}}`.
 
 ### 5.2 Equipment
 - `PUT /v1/equipment/profiles/{id}` request `{profile:{name,active}}` response `{data:{equipmentProfile,version}}`
@@ -490,12 +531,11 @@ Common rules for all endpoints below:
   - same `(user_id, workout_session_id, mutationId)` + different hash => `409 MUTATION_ID_REUSE_CONFLICT`.
 - Required request fields for all workout mutation endpoints in §5.4: `mutationId`, `clientTimestamp`, `clientSequence`, `ifMatchVersion` (except `start`, where `ifMatchVersion` is optional if no existing session row is being transitioned).
 - For local draft operations, `mutationId` **must equal** local op `opId`, and `clientSequence` **must equal** local op `seq`.
-- Server persists `clientSequence` to `workout_session_mutation.client_sequence` and tracks per-session `last_applied_seq`.
-- Sequence enforcement:
-  - duplicate sequence (`clientSequence <= last_applied_seq`) => `409 MUTATION_SEQUENCE_CONFLICT`.
-  - missing gap (`clientSequence > last_applied_seq + 1`) => `409 MUTATION_SEQUENCE_CONFLICT`.
-  - next valid op requires `clientSequence = last_applied_seq + 1`.
-- Stale `ifMatchVersion` => `409 VERSION_CONFLICT` with latest session projection and accepted `lastAppliedSeq`.
+- Canonical sequence source is `workout_session.last_applied_client_sequence`.
+- Transaction order for every workout mutation endpoint: (1) compute `mutationHash` from normalized body excluding `clientTimestamp`; (2) check existing `(user_id, workout_session_id, mutation_id)` in `workout_session_mutation`; (3) same hash => replay stored response before sequence checks; (4) same mutation id + different hash => `409 MUTATION_ID_REUSE_CONFLICT`; (5) lock target `workout_session` row `FOR UPDATE`; (6) validate `ifMatchVersion`; (7) validate terminal state; (8) validate `clientSequence = workout_session.last_applied_client_sequence + 1`; (9) apply mutation; (10) increment `workout_session.version`; (11) set `workout_session.last_applied_client_sequence = clientSequence`; (12) insert `workout_session_mutation`; (13) commit.
+- Sequence conflicts: duplicate or missing-gap sequence returns `409 MUTATION_SEQUENCE_CONFLICT`.
+- Stale `ifMatchVersion` returns `409 VERSION_CONFLICT` with latest session projection and `lastAppliedSeq`.
+- Replay never increments version or sequence.
 - All responses include `data.workoutSession.version` after mutation and optional `idMap` for client/server reconciliation.
 - Terminal statuses: `completed|partial|abandoned|skipped|completed_outside_app|deleted`; any set-log mutation in terminal status => `409 INVALID_SESSION_STATE_TRANSITION`.
 
@@ -512,29 +552,29 @@ Transition rules:
 - If no valid materialized session exists, create recovery row then transition to `in_progress` in same transaction.
 
 `POST /v1/workout-sessions/{id}/set-logs`
-Request required: `mutationId, clientTimestamp, clientSequence, ifMatchVersion, setLog:{exerciseInstanceId,setSource,setIndex}`
+Request required: `mutationId, clientTimestamp, clientSequence, ifMatchVersion, setLog:{setSource,setIndex}` plus exactly one of `setLog.exerciseInstanceId` or `setLog.workoutSessionExerciseId`.
 Request optional: `setLog:{setPrescriptionId,repsCompleted,loadValue,loadUnit,rir,clientSetLogId,substitutionGroupId}`
-Response 200: `{data:{workoutSession:{id,status,version},setLog:{...},idMap:{clientSetLogId:"uuid"}},meta:{mutationId,replayed}}`
-Validation: prescribed requires `setPrescriptionId`; added forbids it.
+Response 200 setLog includes both nullable link fields: `{exerciseInstanceId,workoutSessionExerciseId,...}`.
+Validation follows canonical link matrix in §2.12 (planned prescribed/added and substituted prescribed-style/added).
 
 `PATCH /v1/workout-sessions/{id}/set-logs/{setLogId}`
 Request required: `mutationId, clientTimestamp, clientSequence, ifMatchVersion, patch`
 Request optional patch fields: `repsCompleted,loadValue,loadUnit,rir,state` (state only `active` from active)
-Response 200: `{data:{workoutSession:{version},setLog:{...}},meta:{mutationId,replayed}}`
+Response 200: `{data:{workoutSession:{version},setLog:{exerciseInstanceId|null,workoutSessionExerciseId|null,...}},meta:{mutationId,replayed}}`
 
 `DELETE /v1/workout-sessions/{id}/set-logs/{setLogId}`
 Request required: `mutationId, clientTimestamp, clientSequence, ifMatchVersion`
-Response 200: `{data:{workoutSession:{version},setLog:{id,state:"deleted",deletedAt:"ISO-8601"}},meta:{mutationId,replayed}}`
+Response preserves the same link model (`exerciseInstanceId` and `workoutSessionExerciseId` both present as nullable fields).
 
 `POST /v1/workout-sessions/{id}/set-logs/{setLogId}/skip`
 Request required: `mutationId, clientTimestamp, clientSequence, ifMatchVersion`
 Request optional: `reasonCode, note`
-Response 200: `{data:{workoutSession:{version},setLog:{id,state:"skipped"}},meta:{mutationId,replayed}}`
+Response preserves the same link model (`exerciseInstanceId` and `workoutSessionExerciseId` both present as nullable fields).
 
 `POST /v1/workout-sessions/{id}/substitutions`
 Request required: `mutationId, clientTimestamp, clientSequence, ifMatchVersion, originalExerciseInstanceId, replacementExerciseId`
 Request optional: `reasonCode, keepSetPrescriptions:false|true(default false), clientSubstitutionId`
-Response 200: `{data:{workoutSession:{id,version},sessionExercise:{id,workoutSessionId,sourceExerciseInstanceId,replacementExerciseId,movementIntent,substitutionGroupId,slotIndex},targetSets:[{setIndex,repMin,repMax,targetRir}],idMap:{clientSubstitutionId:"uuid"}},meta:{mutationId,replayed}}`
+Response 200: `{data:{workoutSession:{id,version},sessionExercise:{id,workoutSessionExerciseId,workoutSessionId,sourceExerciseInstanceId,replacementExerciseId,movementIntent,substitutionGroupId,slotIndex},targetSets:[{setIndex,repMin,repMax,targetRir}],idMap:{clientSubstitutionId:"uuid"}},meta:{mutationId,replayed}}` where `targetSets` are virtual response-only targets (not persisted `set_prescription` rows in MVP).
 
 `POST /v1/workout-sessions/{id}/complete`
 Request required: `mutationId, clientTimestamp, clientSequence, ifMatchVersion`
@@ -833,3 +873,14 @@ Rules:
 - Coverage gates are mandatory: every movement intent used by 2-day through 6-day templates must have at least one eligible canonical exercise, and common home and gym equipment profiles must each have feasible coverage.
 - Plan-generation integration tests must fail fast when this seed artifact is missing or fails validation.
 - Contract acceptance requires generator tests to pass using only this seed catalog (no fallback hidden exercises).
+
+
+## 12) Readiness check
+| Item | Status |
+|---|---|
+| Substitution schema/API consistency | Fixed |
+| RLS coverage complete | Fixed |
+| Sequence tracking persistence | Fixed |
+| Seed artifact gate | Fixed |
+| Onboarding initial weight handling | Fixed |
+| Remaining blockers before implementation | None |
