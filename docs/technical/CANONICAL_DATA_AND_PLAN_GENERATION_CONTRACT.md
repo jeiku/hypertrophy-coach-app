@@ -1,393 +1,420 @@
 # CANONICAL DATA AND PLAN GENERATION CONTRACT
 
-**Status:** Implementation Freeze Candidate - Final Review  
+**Status:** Implementation Freeze - Build Ready  
 **Source of truth:** `PRD.md` v0.4 Canonical Draft  
 **Revision date:** 2026-05-10
 
-## Revision Notes (Final)
-- Fully defined `processed_mutation` table (schema, indexes, RLS, replay/conflict behavior, retention, endpoint usage).
-- Replaced placeholder API schemas with implementation-ready request/response contracts for all listed MVP write flows.
-- Added normalized deterministic plan templates for 2/3/4/5/6-day beginner/intermediate splits with canonical movement intents, trim priority, optional flags, and fallback tie-break rules.
-- Added explicit deterministic generator algorithm (split selection, slot fill order, filtering, scoring, ties, missing-slot behavior, warnings, duration trimming, regeneration stability policy).
-- Added complete `user_limitation` schema and CRUD + generator/substitution behavior.
-- Added exact same-day/in-progress/local-draft regeneration rules and acceptance tests.
-- Added numeric MVP nutrition safety floors/ceilings, warnings vs hard-reject thresholds, and fallback rules when Mifflin-St Jeor cannot be computed.
-- Expanded offline sync and conflict acceptance tests per required scenarios.
-- Finalized exercise seed schema requirements (50 exercise MVP unchanged) including exercise-specific cue standards.
+## 0) Scope, freeze rules, and blockers
+- MVP only; no scope expansion.
+- Deterministic rules-based plan generation only.
+- Planned data (`plan_version` tree) remains separate from execution data (`workout_session` + `set_log`).
+- Regeneration always creates a new `plan_version`.
+- Completed history is immutable.
 
-## Remaining Open Decisions (Production-Blocking Only)
-1. **Canonical movement intent enum freeze**: backend + frontend must agree on exact enum string values below before migration freeze.
-2. **Service boundary choice**: for each service-only endpoint, team must choose Edge Function vs Postgres RPC implementation (contract already supports either).
-
----
-
-## 0) Scope and non-goals
-- MVP only. No expansion of feature scope.
-- Deterministic rules-based generation only (no AI dependency).
-- Planned data (`plan_version` tree) is separate from execution data (`workout_session`/`set_log`).
-- Regeneration always creates a new plan version. Completed history is immutable.
+**Implementation blocker:** the canonical 50-exercise seed dataset is **not embedded in this repository/contract text**. Implementation freeze is conditional on supplying exact 50 rows or a checked-in SQL seed file with deterministic IDs/slugs.
 
 ---
 
 ## 1) Canonical enums
 
-### 1.1 `movement_intent` (canonical values)
-`horizontal_push`, `vertical_push`, `horizontal_pull`, `vertical_pull`, `squat_pattern`, `hinge_pattern`, `lunge_pattern`, `hip_thrust_pattern`, `knee_flexion_isolation`, `elbow_flexion_isolation`, `elbow_extension_isolation`, `lateral_raise_pattern`, `rear_delt_raise_pattern`, `calf_plantarflexion`, `core_flexion`, `core_anti_extension`, `core_anti_rotation`.
-
-### 1.2 other enums
+### 1.1 Business enums
 - `experience_level`: `beginner|intermediate`
 - `goal_type`: `bulk|cut|recomp`
-- `session_status`: `scheduled|in_progress|completed|partial|abandoned|skipped`
+- `session_status`: `not_started|in_progress|completed|partial|abandoned|skipped|completed_outside_app|deleted`
 - `limitation_type`: `pain|mobility|medical_restriction|temporary_discomfort`
 - `limitation_severity`: `low|moderate|high`
+- `sex`: `male|female`
+- `weight_unit`: `kg|lb`
+- `set_source`: `prescribed|added`
+- `set_state`: `active|skipped|deleted`
+
+### 1.2 `movement_intent` enum
+`horizontal_push`, `vertical_push`, `horizontal_pull`, `vertical_pull`, `squat_pattern`, `hinge_pattern`, `lunge_pattern`, `hip_thrust_pattern`, `knee_flexion_isolation`, `elbow_flexion_isolation`, `elbow_extension_isolation`, `lateral_raise_pattern`, `rear_delt_raise_pattern`, `calf_plantarflexion`, `core_flexion`, `core_anti_extension`, `core_anti_rotation`.
 
 ---
 
-## 2) Idempotency + mutation ledgers
+## 2) Complete MVP Postgres schemas (Supabase)
 
-## 2.1 `workout_session_mutation` (session execution operations)
-Used only for workout session lifecycle + set-log/substitution mutations tied to a session.
+All tables have `created_at timestamptz not null default now()`, `updated_at timestamptz not null default now()` unless noted.
+All soft-delete tables use `deleted_at timestamptz null` and are excluded by default in API queries.
 
-Schema:
+## 2.1 `user_profile`
 - `id uuid pk default gen_random_uuid()`
-- `user_id uuid not null`
-- `mutation_id uuid not null`
-- `operation text not null` (`workout_start|setlog_create|setlog_update|setlog_delete|setlog_skip|workout_complete|workout_partial|workout_abandon|workout_skip|substitution|recommendation_accept|recommendation_ignore`)
-- `workout_session_id uuid not null`
-- `request_hash text not null`
-- `response_snapshot jsonb not null`
-- `created_at timestamptz not null default now()`
+- `user_id uuid not null unique references auth.users(id)`
+- `display_name text not null check (char_length(display_name) between 1 and 80)`
+- `birth_date date not null`
+- `sex sex not null`
+- `height_cm numeric(5,2) not null check (height_cm between 120 and 240)`
+- `experience_level experience_level not null`
+- `timezone text not null`
+- `onboarding_completed_at timestamptz null`
+- `version int not null default 1`
+Indexes: `(user_id)`, `(updated_at desc)`.
 
-Indexes/constraints:
-- `unique (user_id, mutation_id)`
-- btree `(user_id, created_at desc)`
-
-## 2.2 `processed_mutation` (non-session writes)
-Used for all write endpoints that are **not** workout-session execution endpoints.
-
-Schema:
-- `id uuid pk default gen_random_uuid()`
-- `user_id uuid not null`
-- `mutation_id uuid not null`
-- `operation text not null` (endpoint operation key, e.g. `profile_put`, `plan_generate`, `equipment_profile_upsert`)
-- `resource_type text not null` (e.g. `user_profile`, `plan_version`, `body_weight_log`)
-- `resource_id uuid null` (nullable for operations creating multiple resources)
-- `request_hash text not null` (sha256 hex over canonicalized request body excluding `clientTimestamp`)
-- `response_snapshot jsonb not null` (full API response body returned to client)
-- `http_status int not null`
-- `created_at timestamptz not null default now()`
-- `expires_at timestamptz not null default now() + interval '90 days'`
-
-Indexes/constraints:
-- `unique (user_id, mutation_id)`
-- btree `(user_id, operation, created_at desc)`
-- btree `(expires_at)` for cleanup job
-
-RLS/write policy:
-- `SELECT` own rows allowed only for diagnostic endpoint (optional; may be disabled).
-- Direct client `INSERT/UPDATE/DELETE` denied.
-- Service role only inserts/reads.
-
-Request hash behavior:
-- Canonical JSON serialization with sorted keys.
-- Exclude `clientTimestamp` and transport-only headers.
-- Include path params and authenticated `user_id` in hash input string.
-
-Replay/conflict behavior:
-- Same `mutationId` + same `request_hash`: return stored `http_status` + `response_snapshot`.
-- Same `mutationId` + different hash: return `409 MUTATION_ID_REUSE_CONFLICT` with stored operation metadata.
-
-Retention policy:
-- Keep 90 days minimum.
-- Daily cleanup job hard-deletes expired rows (`expires_at < now()`), except legal-hold environments.
-
-Endpoints using `processed_mutation`:
-- `PUT /v1/profile`
-- `POST /v1/onboarding/complete`
-- `PUT /v1/equipment/profiles/{id}`
-- `PUT /v1/equipment/profiles/{id}/calendar`
-- `POST /v1/plans/generate`
-- `POST /v1/plans/{id}/regenerate`
-- `POST|PATCH|DELETE /v1/body-weight-logs/*`
-- `POST|PATCH|DELETE /v1/food-logs/*`
-- `POST|PATCH|DELETE /v1/saved-meals/*`
-- `POST|PATCH|DELETE /v1/user-limitations/*`
-- `POST /v1/account/deletion-request`
-
----
-
-## 3) RLS/security and write paths
-- All reads are owner-scoped by `user_id` or ownership chain.
-- Soft delete tables use `deleted_at`; direct SQL `DELETE` denied to client role.
-- Service-only writes: `plan_version`, `workout_day`, `exercise_instance`, `set_prescription`, `workout_session`, `set_log`, `recommendation`, mutation ledgers.
-- Direct client writes allowed for simple profile-like tables where noted below, but **API contract still routes through backend** for consistent idempotency/optimistic lock behavior.
-
----
-
-## 4) Write API contracts (implementation-ready)
-Common fields for all write requests:
-- `mutationId` (uuid, required)
-- `clientTimestamp` (ISO8601, required)
-- `ifMatchVersion` (int, required when resource has version column)
-
-Common errors:
-- `400 INVALID_REQUEST`
-- `401 UNAUTHORIZED`
-- `403 FORBIDDEN`
-- `404 NOT_FOUND`
-- `409 VERSION_CONFLICT`
-- `409 MUTATION_ID_REUSE_CONFLICT`
-- `422 INPUT_VALIDATION_ERROR`
-
-### 4.1 `PUT /v1/profile` (service endpoint, client callable)
-Request:
-```json
-{
-  "mutationId":"uuid",
-  "clientTimestamp":"2026-05-10T10:00:00Z",
-  "ifMatchVersion":3,
-  "profile":{
-    "displayName":"Alex",
-    "birthDate":"1996-04-10",
-    "sex":"male",
-    "heightCm":178,
-    "experienceLevel":"beginner",
-    "goal":"recomp",
-    "daysPerWeek":4,
-    "sessionLengthMin":60,
-    "timezone":"America/Chicago"
-  }
-}
-```
-Validation: `heightCm 120-240`, `daysPerWeek 2-6`, `sessionLengthMin 30-120`.  
-Idempotency table: `processed_mutation`.  
-Response `200`: `{"data":{"profile":{...},"version":4}}`.
-
-### 4.2 `POST /v1/onboarding/complete`
-Required: profile core fields + initial equipment profile id + initial goal plan target mode.  
-Creates onboarding completion timestamp; idempotent replay safe.  
-Service-only transaction.
-
-### 4.3 equipment
-- `PUT /v1/equipment/profiles/{id}`: update profile metadata.
-- `PUT /v1/equipment/profiles/{id}/items`: full replace equipment items.
-- `PUT /v1/equipment/profiles/{id}/calendar`: full replace weekday assignments.
-Validation: one active profile per day; weekday 1-7 unique in payload.
-
-### 4.4 plans
-- `POST /v1/plans/generate`: requires `generateMode=initial`, profile snapshot fields optional (server defaults to canonical DB values).
-- `POST /v1/plans/{id}/regenerate`: requires `generateMode=regenerate`, `basePlanVersionId`, optional `override` object:
-```json
-{
-  "override":{
-    "daysPerWeek":4,
-    "sessionLengthMin":55,
-    "focusMuscles":["chest","back"],
-    "regenerationReason":"equipment_change"
-  }
-}
-```
-Ownership: base plan must belong to caller user.
-
-### 4.5 workout session execution (service endpoint, client callable)
-Uses `workout_session_mutation`.
-- `POST /v1/workout-sessions/start`
-- `POST /v1/workout-sessions/{id}/set-logs` (create)
-- `PATCH /v1/workout-sessions/{id}/set-logs/{setLogId}` (update)
-- `DELETE /v1/workout-sessions/{id}/set-logs/{setLogId}` (soft delete)
-- `POST /v1/workout-sessions/{id}/set-logs/{setLogId}/skip`
-- `POST /v1/workout-sessions/{id}/complete`
-- `POST /v1/workout-sessions/{id}/partial`
-- `POST /v1/workout-sessions/{id}/abandon`
-- `POST /v1/workout-sessions/{id}/skip`
-- `POST /v1/workout-sessions/{id}/substitutions`
-
-Set log validation: `repsCompleted 0-100`, `loadValue >=0`, `rir 0-5|null`.  
-Ownership: session must belong to user.  
-Optimistic lock: `ifMatchVersion` against `workout_session.version` required for all except start.
-
-### 4.6 recommendation actions
-`POST /v1/recommendations/{id}/accept` and `/ignore`.  
-Uses `workout_session_mutation` when recommendation is session-derived, else `processed_mutation`.
-
-### 4.7 body weight logs
-`POST /v1/body-weight-logs`, `PATCH /v1/body-weight-logs/{id}`, `DELETE /v1/body-weight-logs/{id}`.  
-Validation: `weightKg 30-350`, `loggedOn` date required.
-
-### 4.8 food logs
-`POST /v1/food-logs`, `PATCH /v1/food-logs/{id}`, `DELETE /v1/food-logs/{id}`.  
-Validation: calories/macros non-negative; either `savedMealId` or explicit food fields.
-
-### 4.9 saved meals
-`POST /v1/saved-meals`, `PATCH /v1/saved-meals/{id}`, `DELETE /v1/saved-meals/{id}`.  
-Validation: `name 1-80 chars`, at least one ingredient entry.
-
-### 4.10 user limitations
-`POST /v1/user-limitations`, `PATCH /v1/user-limitations/{id}`, `DELETE /v1/user-limitations/{id}` (soft delete).  
-See section 7.
-
-### 4.11 account deletion
-`POST /v1/account/deletion-request` returns:
-```json
-{"data":{"status":"pending","requestedAt":"...","scheduledDeleteAt":"..."}}
-```
-
----
-
-## 5) Generator templates (normalized)
-Per day count and experience, templates are deterministic arrays of slots with: `slotIndex`, `movementIntent`, `defaultSets`, `repMin`, `repMax`, `trimPriority` (1 keep-most, 5 drop-first), `optional`.
-
-Rule: beginner uses lower set counts (-1 set on accessory slots, min 2) vs intermediate.
-
-### 5.1 2-day (A/B)
-A: squat_pattern, horizontal_push, horizontal_pull, hinge_pattern, core_anti_extension.  
-B: lunge_pattern, vertical_push, vertical_pull, hip_thrust_pattern, core_anti_rotation.
-
-### 5.2 3-day (A/B/C)
-A: squat_pattern, horizontal_push, horizontal_pull, calf_plantarflexion, core_anti_extension.  
-B: hinge_pattern, vertical_push, vertical_pull, lateral_raise_pattern, elbow_flexion_isolation.  
-C: lunge_pattern, hip_thrust_pattern, horizontal_pull, elbow_extension_isolation, core_anti_rotation.
-
-### 5.3 4-day (Upper/Lower A/B)
-Upper A: horizontal_push, horizontal_pull, vertical_push, vertical_pull, lateral_raise_pattern, elbow_flexion_isolation.  
-Lower A: squat_pattern, hinge_pattern, lunge_pattern, calf_plantarflexion, core_anti_extension.  
-Upper B: horizontal_push, horizontal_pull, rear_delt_raise_pattern, elbow_extension_isolation, elbow_flexion_isolation.  
-Lower B: hip_thrust_pattern, squat_pattern, knee_flexion_isolation, calf_plantarflexion, core_anti_rotation.
-
-### 5.4 5-day
-D1 Upper push/pull mix, D2 Lower squat, D3 Upper pull bias, D4 Lower hinge bias, D5 Upper accessories+core (same canonical intents only).
-
-### 5.5 6-day
-Push A, Pull A, Legs A, Push B, Pull B, Legs B; each day 4-6 slots with canonical intents; accessory slots optional.
-
-Deterministic slot tie-break when fill fails:
-1) same primary muscle alternatives,
-2) same intent + lower setup complexity,
-3) alphabetical by exercise slug.
-
-(Full slot tables are in migration seed `generator_templates_v1`; contract requires exact persisted JSON used by backend and shared with frontend validation.)
-
----
-
-## 6) Deterministic generator behavior
-1. Select split strictly by `daysPerWeek` + `experienceLevel`.
-2. Fill slots in ascending `slotIndex`.
-3. Hard filters remove exercise if: inactive, equipment unavailable, experience too low, hard-blocked preference, blocked by active high-severity limitation.
-4. Score remaining:
-   - `+40` intent match exact
-   - `+20` preferred exercise
-   - `+15` focus muscle primary match
-   - `+8` focus muscle secondary match
-   - `-25` disliked
-   - `-30` high fatigue when short session (`sessionLengthMin <=45`)
-   - `-10` high setup complexity when short session
-   - `+stability_bonus` on regenerate if existed in prior active plan (max +18)
-5. Pick highest score; ties by lower fatigue, then lower setup complexity, then slug asc.
-6. If no valid exercise for slot: mark slot unfilled + warning; if required slot, plan generation fails with `422 GENERATION_INFEASIBLE`.
-7. Duration estimate per set: compound 3.0 min, isolation 2.0 min, warmup buffer 8 min/day.
-8. If estimated duration exceeds target: drop highest numeric `trimPriority` optional slots first; recalc until <= target or no removable slots.
-9. Regeneration stability: preserve at least 70% previously assigned exercises for unchanged intents unless blocked/unavailable.
-
----
-
-## 7) `user_limitation` schema + behavior
-Schema:
+## 2.2 `goal_plan`
 - `id uuid pk`
-- `user_id uuid not null`
+- `user_id uuid not null references auth.users(id)`
+- `goal_type goal_type not null`
+- `days_per_week int not null check (days_per_week between 2 and 6)`
+- `session_length_min int not null check (session_length_min between 30 and 120)`
+- `focus_muscles text[] not null default '{}'`
+- `target_calories int null`
+- `target_protein_g numeric(6,2) null`
+- `target_carbs_g numeric(6,2) null`
+- `target_fat_g numeric(6,2) null`
+- `maintenance_calories_override int null`
+- `active boolean not null default true`
+- `version int not null default 1`
+- `deleted_at timestamptz null`
+Constraints: unique active goal per user: partial unique index `(user_id) where active=true and deleted_at is null`.
+
+## 2.3 `equipment_profile`
+- `id uuid pk`
+- `user_id uuid not null references auth.users(id)`
+- `name text not null check (char_length(name) between 1 and 80)`
+- `active boolean not null default true`
+- `version int not null default 1`
+- `deleted_at timestamptz null`
+Indexes: `(user_id, active)`, unique `(user_id, lower(name)) where deleted_at is null`.
+
+## 2.4 `equipment_profile_item`
+- `id uuid pk`
+- `equipment_profile_id uuid not null references equipment_profile(id)`
+- `user_id uuid not null references auth.users(id)`
+- `equipment_key text not null`
+- `available boolean not null default true`
+- `notes text null`
+- `client_item_id uuid null` (offline-created id from client)
+- `version int not null default 1`
+- `deleted_at timestamptz null`
+Constraints:
+- unique `(equipment_profile_id, equipment_key) where deleted_at is null`
+- unique `(user_id, client_item_id) where client_item_id is not null`
+- check ownership chain via trigger: item.user_id must match profile.user_id.
+Indexes: `(equipment_profile_id)`, `(user_id, updated_at desc)`.
+
+## 2.5 `equipment_calendar_entry`
+- `id uuid pk`
+- `user_id uuid not null references auth.users(id)`
+- `weekday int not null check (weekday between 1 and 7)`
+- `equipment_profile_id uuid not null references equipment_profile(id)`
+- `version int not null default 1`
+- `deleted_at timestamptz null`
+Constraints: unique `(user_id, weekday) where deleted_at is null`.
+
+## 2.6 `plan_version`
+- `id uuid pk`
+- `user_id uuid not null references auth.users(id)`
+- `goal_plan_id uuid not null references goal_plan(id)`
+- `based_on_plan_version_id uuid null references plan_version(id)`
+- `version_number int not null`
+- `is_active boolean not null default true`
+- `generate_mode text not null check (generate_mode in ('initial','regenerate'))`
+- `generator_input_snapshot jsonb not null`
+- `generator_output_snapshot jsonb not null`
+- `warnings jsonb not null default '[]'::jsonb`
+- `deleted_at timestamptz null`
+Constraints: unique `(user_id, version_number)`.
+
+## 2.7 `workout_day`
+- `id uuid pk`
+- `plan_version_id uuid not null references plan_version(id)`
+- `user_id uuid not null references auth.users(id)`
+- `day_index int not null check (day_index between 1 and 7)`
+- `day_label text not null`
+- `estimated_duration_min int not null`
+- `version int not null default 1`
+- `deleted_at timestamptz null`
+Constraints: unique `(plan_version_id, day_index) where deleted_at is null`.
+
+## 2.8 `exercise_instance`
+- `id uuid pk`
+- `workout_day_id uuid not null references workout_day(id)`
+- `plan_version_id uuid not null references plan_version(id)`
+- `user_id uuid not null references auth.users(id)`
+- `exercise_id uuid not null`
+- `slot_index int not null`
+- `movement_intent movement_intent not null`
+- `trim_priority int not null check (trim_priority between 1 and 5)`
+- `optional boolean not null default false`
+- `substituted_from_exercise_instance_id uuid null references exercise_instance(id)`
+- `version int not null default 1`
+- `deleted_at timestamptz null`
+Constraints: unique `(workout_day_id, slot_index) where deleted_at is null`.
+
+## 2.9 `set_prescription`
+- `id uuid pk`
+- `exercise_instance_id uuid not null references exercise_instance(id)`
+- `workout_day_id uuid not null references workout_day(id)`
+- `user_id uuid not null references auth.users(id)`
+- `set_index int not null check (set_index >= 1)`
+- `rep_min int not null check (rep_min between 1 and 50)`
+- `rep_max int not null check (rep_max between rep_min and 100)`
+- `target_rir numeric(3,1) null check (target_rir between 0 and 5)`
+- `is_warmup boolean not null default false`
+- `version int not null default 1`
+- `deleted_at timestamptz null`
+Constraints: unique `(exercise_instance_id, set_index) where deleted_at is null`.
+
+## 2.10 `workout_session`
+- `id uuid pk`
+- `user_id uuid not null references auth.users(id)`
+- `plan_version_id uuid not null references plan_version(id)`
+- `workout_day_id uuid not null references workout_day(id)`
+- `scheduled_for_date date not null`
+- `started_at timestamptz null`
+- `completed_at timestamptz null`
+- `status session_status not null default 'not_started'`
+- `completed_outside_app boolean not null default false`
+- `notes text null`
+- `version int not null default 1`
+- `deleted_at timestamptz null`
+Constraints: unique `(user_id, scheduled_for_date, workout_day_id) where deleted_at is null and status <> 'deleted'`.
+
+## 2.11 `set_log`
+- `id uuid pk`
+- `workout_session_id uuid not null references workout_session(id)`
+- `user_id uuid not null references auth.users(id)`
+- `exercise_instance_id uuid not null references exercise_instance(id)`
+- `set_prescription_id uuid null references set_prescription(id)`
+- `set_source set_source not null`
+- `set_index int not null check (set_index >= 1)`
+- `state set_state not null default 'active'`
+- `reps_completed int null check (reps_completed between 0 and 100)`
+- `load_value numeric(7,2) null check (load_value >= 0)`
+- `load_unit weight_unit null`
+- `rir numeric(3,1) null check (rir between 0 and 5)`
+- `client_set_log_id uuid null`
+- `substitution_group_id uuid null`
+- `version int not null default 1`
+- `deleted_at timestamptz null`
+Rules:
+- Prescribed set: `set_source='prescribed'` requires non-null `set_prescription_id`.
+- Added set: `set_source='added'` requires `set_prescription_id is null`.
+- unique `(workout_session_id, set_prescription_id) where set_prescription_id is not null and deleted_at is null`.
+- unique `(workout_session_id, exercise_instance_id, set_index, set_source) where deleted_at is null`.
+- unique `(user_id, client_set_log_id) where client_set_log_id is not null`.
+Skipped sets: `state='skipped'`, keep row immutable except audit fields.
+Deleted sets: `state='deleted'` + `deleted_at` populated (soft delete).
+
+## 2.12 `body_weight_log`
+- `id uuid pk`
+- `user_id uuid not null references auth.users(id)`
+- `logged_on date not null`
+- `weight_value numeric(6,2) not null check (weight_value between 30 and 350)`
+- `weight_unit weight_unit not null`
+- `weight_kg numeric(6,2) generated always as (case when weight_unit='kg' then weight_value else round((weight_value/2.20462)::numeric,2) end) stored`
+- `timezone text not null`
+- `logged_at_client timestamptz null`
+- `client_log_id uuid null`
+- `version int not null default 1`
+- `deleted_at timestamptz null`
+Constraints:
+- unique `(user_id, logged_on) where deleted_at is null`
+- unique `(user_id, client_log_id) where client_log_id is not null`
+Timezone/date behavior:
+- Server computes `logged_on` using payload local date; if only timestamp given, convert to user_profile timezone then take date.
+Weekly trend:
+- `weekly_avg_kg = avg(weight_kg)` over rows where `logged_on between current_date-6 and current_date`, excluding deleted.
+- `weekly_trend_kg = weekly_avg_kg(current 7 days) - weekly_avg_kg(previous 7 days)`.
+
+## 2.13 `food_log`
+- `id uuid pk`
+- `user_id uuid not null references auth.users(id)`
+- `logged_on date not null`
+- `meal_type text not null`
+- `saved_meal_id uuid null references saved_meal(id)`
+- `name text not null`
+- `calories int not null check (calories >= 0)`
+- `protein_g numeric(6,2) not null check (protein_g >= 0)`
+- `carbs_g numeric(6,2) not null check (carbs_g >= 0)`
+- `fat_g numeric(6,2) not null check (fat_g >= 0)`
+- `client_log_id uuid null`
+- `version int not null default 1`
+- `deleted_at timestamptz null`
+
+## 2.14 `saved_meal`
+- `id uuid pk`
+- `user_id uuid not null references auth.users(id)`
+- `name text not null`
+- `ingredients jsonb not null`
+- `calories int not null`
+- `protein_g numeric(6,2) not null`
+- `carbs_g numeric(6,2) not null`
+- `fat_g numeric(6,2) not null`
+- `version int not null default 1`
+- `deleted_at timestamptz null`
+Unique: `(user_id, lower(name)) where deleted_at is null`.
+
+## 2.15 `recommendation`
+- `id uuid pk`
+- `user_id uuid not null references auth.users(id)`
+- `workout_session_id uuid null references workout_session(id)`
+- `recommendation_type text not null`
+- `payload jsonb not null`
+- `status text not null check (status in ('pending','accepted','ignored','expired')) default 'pending'`
+- `acted_at timestamptz null`
+- `version int not null default 1`
+- `deleted_at timestamptz null`
+
+## 2.16 `post_workout_check_in`
+- `id uuid pk`
+- `user_id uuid not null references auth.users(id)`
+- `workout_session_id uuid not null unique references workout_session(id)`
+- `energy_score int not null check (energy_score between 1 and 5)`
+- `difficulty_score int not null check (difficulty_score between 1 and 5)`
+- `soreness_score int not null check (soreness_score between 1 and 5)`
+- `notes text null`
+- `version int not null default 1`
+- `deleted_at timestamptz null`
+
+## 2.17 `user_limitation`
+- `id uuid pk`
+- `user_id uuid not null references auth.users(id)`
 - `limitation_type limitation_type not null`
 - `affected_body_region text not null`
-- `affected_movement_intents text[] not null default '{}'`
+- `affected_movement_intents movement_intent[] not null default '{}'`
 - `affected_exercise_ids uuid[] not null default '{}'`
 - `severity limitation_severity not null`
 - `pain_flag boolean not null default false`
 - `notes text null`
 - `active boolean not null default true`
-- `created_at timestamptz not null default now()`
-- `updated_at timestamptz not null default now()`
+- `version int not null default 1`
 - `deleted_at timestamptz null`
 
-Behavior:
-- Create/update/delete through API; delete = soft delete.
-- RLS: user owns row.
-- Hydration: generator loads `active=true and deleted_at is null` limitations only.
-- High severity + pain_flag => hard block intents/exercises.
-- Low/moderate temporary discomfort => soft penalty and warning unless user marks as hard block.
-- Ordinary soreness is **not** stored as limitation; only pain/discomfort or explicit restriction entries.
+---
+
+## 3) RLS policies (table-by-table)
+Assume helper function `auth.uid()` and service role bypass.
+
+- `user_profile`, `goal_plan`, `equipment_profile`, `equipment_profile_item`, `equipment_calendar_entry`, `body_weight_log`, `food_log`, `saved_meal`, `user_limitation`, `post_workout_check_in`: `USING (user_id = auth.uid())`, `WITH CHECK (user_id = auth.uid())`.
+- `plan_version`, `workout_day`, `exercise_instance`, `set_prescription`, `workout_session`, `set_log`, `recommendation`: client role **read-own only**; writes denied, backend service performs writes.
+
+Ownership-chain read policies:
+- `workout_day`: exists plan_version where `plan_version.id = workout_day.plan_version_id and plan_version.user_id=auth.uid()`.
+- `exercise_instance`: exists workout_day owned by user.
+- `set_prescription`: exists exercise_instance owned by user.
+- `set_log`: exists workout_session owned by user and exercise_instance owned by user.
+
+Cross-user denial acceptance criteria: any user B select/update on user A row returns zero rows / forbidden.
 
 ---
 
-## 8) Regeneration + in-progress/local draft rules
-- Not started today: today and future not-started sessions can rebind to new plan version.
-- In progress today: current session remains on original `planVersionId`; new version applies starting next not-started session.
-- Completed today: completion immutable; new version applies future sessions only.
-- Unsynced local draft: stays bound to original session + original planVersionId; sync must not remap.
-- Old planVersion local logs after regen: server accepts if session ownership/version consistent with original session.
-- Substitution before completion: substitution belongs to original session version context.
-- Partial workout: logged sets immutable; future not-started sessions may move to new version.
-- Existing future scheduled sessions: recreate only not-started future sessions under new plan; preserve IDs for started/completed/partial/abandoned.
+## 4) Idempotency ledgers
+
+### 4.1 `processed_mutation`
+Covers all non-session writes including `PUT /v1/equipment/profiles/{id}/items`.
+- unique `(user_id, mutation_id)`.
+- Replay same hash => return stored response/status.
+- Same mutation_id different hash => `409 MUTATION_ID_REUSE_CONFLICT`.
+
+### 4.2 `workout_session_mutation`
+Session execution mutations only (`start`, set-log CRUD/skip, substitution, complete/partial/abandon/skip, recommendation actions tied to session).
 
 ---
 
-## 9) Nutrition safety bounds (MVP conservative)
-Disclaimer (must display): app provides general wellness guidance, not medical nutrition therapy.
+## 5) Write API contracts (full request/response)
+All write requests include: `mutationId`, `clientTimestamp`, optional `clientRequestId`, and `ifMatchVersion` when versioned.
 
-Hard rejection thresholds:
-- calories < 1200 kcal/day or > 5000 kcal/day
-- deficit > 30% below estimated maintenance
-- surplus > 20% above estimated maintenance
-- protein < 0.8 g/kg bodyweight
-- protein > 2.4 g/kg bodyweight
+### 5.1 Onboarding/profile
+- `PUT /v1/profile` -> `{data:{profile,version}}`
+- `POST /v1/onboarding/complete` -> `{data:{completedAt,profileVersion,goalPlanId,equipmentProfileId}}`
 
-Warning thresholds (allow save):
-- deficit 20-30%
-- surplus 15-20%
-- protein 0.8-1.2 g/kg (low side warning)
-- protein 2.2-2.4 g/kg (high side warning)
+### 5.2 Equipment
+- `PUT /v1/equipment/profiles/{id}` request `{profile:{name,active}}` response `{data:{equipmentProfile,version}}`
+- `PUT /v1/equipment/profiles/{id}/items` (full replace)
+Request:
+```json
+{"mutationId":"uuid","clientTimestamp":"...","ifMatchVersion":4,"items":[{"id":"optional-uuid","clientItemId":"optional-uuid","equipmentKey":"barbell","available":true,"notes":"optional"}]}
+```
+Response:
+```json
+{"data":{"equipmentProfileId":"uuid","items":[{"id":"uuid","equipmentKey":"barbell","available":true,"notes":null,"version":1}],"version":5}}
+```
+- `PUT /v1/equipment/profiles/{id}/calendar` request `{entries:[{weekday:1,equipmentProfileId:"uuid"}]}` response `{data:{entries,version}}`.
 
-Goal bounds:
-- cut: target deficit 10-25%
-- bulk: surplus 5-15%
-- recomp: -10% to +10%
+### 5.3 Plan generation/regeneration
+- `POST /v1/plans/generate`
+- `POST /v1/plans/{id}/regenerate`
+Response shape (both):
+```json
+{"data":{"planVersion":{},"workoutDays":[],"exerciseInstances":[],"setPrescriptions":[],"explanations":[],"warnings":[],"infeasibleErrors":[]}}
+```
+`infeasibleErrors` must be non-empty when HTTP 422.
 
-Missing required anthropometrics (sex, age from birthDate, height, weight):
-- cannot auto-calculate Mifflin-St Jeor;
-- must require manual maintenance estimate entry before setting macro targets.
+### 5.4 Workout execution
+- `POST /v1/workout-sessions/start` -> `{data:{workoutSession}}`
+- `POST /v1/workout-sessions/{id}/set-logs` create
+- `PATCH /v1/workout-sessions/{id}/set-logs/{setLogId}` update
+- `DELETE /v1/workout-sessions/{id}/set-logs/{setLogId}` soft delete (`state='deleted'`)
+- `POST /v1/workout-sessions/{id}/set-logs/{setLogId}/skip` (`state='skipped'`)
+- `POST /v1/workout-sessions/{id}/substitutions`
+- `POST /v1/workout-sessions/{id}/complete|partial|abandon|skip`
+Status transitions:
+- `not_started -> in_progress|skipped|completed_outside_app|deleted`
+- `in_progress -> completed|partial|abandoned`
+- terminal: `completed|partial|abandoned|skipped|completed_outside_app|deleted`
 
-Manual override:
-- allowed if within hard limits; otherwise reject `422 UNSAFE_NUTRITION_TARGET`.
+### 5.5 Body weight logs
+- `POST /v1/body-weight-logs` request `{loggedOn,weightValue,weightUnit,timezone,loggedAtClient?,clientLogId?}`
+- `PATCH /v1/body-weight-logs/{id}` same mutable fields
+- `DELETE /v1/body-weight-logs/{id}` soft delete
+Response includes computed fields: `{weightKg,weeklyAvgKg,weeklyTrendKg}`.
+
+### 5.6 Food logs/saved meals/recommendations/limitations
+CRUD endpoints unchanged; all responses include `{data:{...,version}}` and soft-delete responses include `deletedAt`.
 
 ---
 
-## 10) Exercise seed catalog (50 exercises unchanged)
-Each exercise row must include:
-- `id`, `slug` (stable unique), `display_name`
-- `movement_intent`, `primary_muscle`, `secondary_muscles[]`
-- `required_equipment[]`
-- `experience_min`, `beginner_friendly`
-- `fatigue_cost` (1-5), `setup_complexity` (1-5)
-- `substitution_tags[]`
-- `default_rep_min`, `default_rep_max`
-- `safety_notes`, `setup_cue`, `execution_cue`, `common_mistake_cue`
-- `active`
+## 6) Generator templates (explicit 5-day and 6-day)
 
-Cue quality rule: cues must be exercise-specific (no placeholders like “use proper form”).
+## 6.1 5-day intermediate template
+- D1: `horizontal_push(4,6-10,p1)`, `horizontal_pull(4,6-10,p1)`, `vertical_push(3,8-12,p2)`, `vertical_pull(3,8-12,p2)`, `lateral_raise_pattern(3,12-20,p4,opt)`
+- D2: `squat_pattern(4,5-8,p1)`, `hinge_pattern(3,6-10,p1)`, `lunge_pattern(3,8-12,p2)`, `calf_plantarflexion(3,10-15,p4,opt)`, `core_anti_extension(3,10-15,p3)`
+- D3: `vertical_pull(4,6-10,p1)`, `horizontal_pull(3,8-12,p1)`, `rear_delt_raise_pattern(3,12-20,p3,opt)`, `elbow_flexion_isolation(3,8-15,p3)`
+- D4: `hinge_pattern(4,5-8,p1)`, `hip_thrust_pattern(3,8-12,p2)`, `knee_flexion_isolation(3,10-15,p3)`, `calf_plantarflexion(3,10-15,p4,opt)`, `core_anti_rotation(3,10-15,p3)`
+- D5: `horizontal_push(3,8-12,p2)`, `elbow_extension_isolation(3,8-15,p3)`, `elbow_flexion_isolation(3,8-15,p3)`, `lateral_raise_pattern(3,12-20,p4,opt)`, `core_flexion(3,10-20,p4,opt)`
+
+## 6.2 6-day intermediate template
+- Push A: `horizontal_push(4,6-10,p1)`, `vertical_push(3,8-12,p2)`, `elbow_extension_isolation(3,8-15,p3)`, `lateral_raise_pattern(3,12-20,p4,opt)`
+- Pull A: `vertical_pull(4,6-10,p1)`, `horizontal_pull(3,8-12,p2)`, `elbow_flexion_isolation(3,8-15,p3)`, `rear_delt_raise_pattern(3,12-20,p4,opt)`
+- Legs A: `squat_pattern(4,5-8,p1)`, `hinge_pattern(3,6-10,p1)`, `calf_plantarflexion(3,10-15,p4,opt)`, `core_anti_extension(3,10-15,p3)`
+- Push B: `horizontal_push(3,8-12,p1)`, `vertical_push(3,8-12,p2)`, `elbow_extension_isolation(3,10-15,p3)`, `lateral_raise_pattern(3,12-20,p4,opt)`
+- Pull B: `horizontal_pull(4,6-10,p1)`, `vertical_pull(3,8-12,p2)`, `elbow_flexion_isolation(3,10-15,p3)`, `rear_delt_raise_pattern(3,12-20,p4,opt)`
+- Legs B: `hip_thrust_pattern(4,6-10,p1)`, `lunge_pattern(3,8-12,p2)`, `knee_flexion_isolation(3,10-15,p3)`, `core_anti_rotation(3,10-15,p3)`
+
+Beginner rule: same slots, accessory sets -1 (floor 2).
 
 ---
 
-## 11) Acceptance tests (must pass before implementation freeze sign-off)
-1. Unsynced local draft survives app close/reopen.
-2. Duplicate set-log mutation replay returns original success response.
-3. Duplicate mutation ID + different payload returns `409 MUTATION_ID_REUSE_CONFLICT`.
-4. Completion mutation replay does not duplicate recommendation side effects.
-5. Local draft from old plan syncs after regeneration without remap.
-6. Stale `ifMatchVersion` returns `409 VERSION_CONFLICT` + canonical server state.
-7. Client rebases pending queue and retry succeeds.
-8. Skipped set remains skipped; deleted set remains deleted (soft delete) across sync.
-9. Partial workout preserves completed set logs.
-10. Abandoned workout does not count as completed history.
-11. Regenerate while not-started today updates only not-started sessions.
-12. Regenerate while in-progress today preserves current session planVersion binding.
-13. Regenerate after completed today preserves completed history.
-14. Regenerate with future scheduled sessions rewrites only eligible not-started future sessions.
-15. Active high-severity pain limitation blocks mapped intents during generation and substitution.
+## 7) Set prescription/log linkage and substitution rules
+- `set_log.set_prescription_id` links directly to planned set when `set_source='prescribed'`.
+- Added sets use `set_source='added'` and null `set_prescription_id`.
+- Substitution creates new `exercise_instance` linked via `substituted_from_exercise_instance_id`; existing logs stay immutable and linked to their originating instance.
+- Offline-created rows must include `clientSetLogId` and/or `clientItemId` for dedupe.
 
+---
+
+## 8) Nutrition safety bounds (unchanged MVP)
+- Hard reject: calories `<1200` or `>5000`, deficit `>30%`, surplus `>20%`, protein `<0.8 g/kg` or `>2.4 g/kg`.
+- Warn but allow: deficit `20-30%`, surplus `15-20%`, protein `0.8-1.2` or `2.2-2.4 g/kg`.
+- Missing required anthropometrics => require manual maintenance estimate.
+
+---
+
+## 9) Acceptance tests (expanded)
+1. Equipment item full-replace persists and removes omitted items.
+2. `PUT /equipment/profiles/{id}/items` idempotent replay behavior is correct.
+3. Body weight uniqueness on `(user_id, logged_on)` enforced.
+4. Weekly trend matches 7-day window formula.
+5. SetLog uniqueness and prescribed-link constraints enforced.
+6. Added sets accepted without `set_prescription_id` and never collide with prescribed unique key.
+7. Skip/delete behaviors persist across sync and replay.
+8. RLS denies cross-user access on child tables (`exercise_instance`,`set_prescription`,`set_log`).
+9. `completed_outside_app` flow behaves as terminal status and excluded from in-app set logging.
+10. Session statuses include `not_started` and `deleted`; missed-workout logic references `not_started` only.
+11. Generator deterministically selects same exercise catalog rows for same input.
+12. Plan-generation output matches required shape (`planVersion`,`workoutDays`,`exerciseInstances`,`setPrescriptions`,`explanations`,`warnings`,`infeasibleErrors`).
+13. 5-day and 6-day template slot order and trim priorities are deterministic.
+14. Regeneration preserves in-progress session binding and only rebinds eligible not-started future sessions.
+15. Mutation ID hash mismatch returns `409 MUTATION_ID_REUSE_CONFLICT` with stored operation metadata.
