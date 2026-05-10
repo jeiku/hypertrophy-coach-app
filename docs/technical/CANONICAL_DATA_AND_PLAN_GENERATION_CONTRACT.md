@@ -400,13 +400,15 @@ Columns:
 - `pain_location pain_location[] not null default '{}'`
 - `pain_type pain_type null`
 - `pain_notes text null check (char_length(pain_notes) <= 1000)`
-- `fatigue_level fatigue_level not null`
-- `form_breakdown boolean not null default false`
+- `fatigue_level fatigue_level null`
+- `form_breakdown boolean null`
 - `created_at timestamptz not null default now()`
 - `updated_at timestamptz not null default now()`
 - `version_token integer not null default 1`
 
 Constraints:
+- `soreness_level` default persisted value is `mild` when client skips soreness input.
+- skipped optional fields are represented as `null` (`fatigue_level`, `form_breakdown`, `soreness_location`).
 - if `pain_flag=false`: `pain_location` empty AND `pain_type` null.
 - if `pain_flag=true`: at least one `pain_location` and non-null `pain_type`.
 
@@ -429,6 +431,7 @@ Columns:
 - `target_entity_id uuid not null`
 - `suggested_change jsonb not null`
 - `ignored_reason recommendation_ignored_reason null`
+- `ignored_reason_text text null check (char_length(ignored_reason_text) <= 500)`
 - `created_at timestamptz not null default now()`
 - `updated_at timestamptz not null default now()`
 - `version_token integer not null default 1`
@@ -469,6 +472,27 @@ Generator slot object schema:
 - `targetRepMax smallint not null`
 - `targetRirMin numeric(3,1) null`
 - `targetRirMax numeric(3,1) null`
+
+PRD slot taxonomy mapping (non-lossy; authoritative for generator/output APIs):
+
+| Internal movementIntent | PRD slot taxonomy | isolationSubTag |
+|---|---|---|
+| knee_dominant_squat | knee_dominant_squat | null |
+| hip_hinge | hip_hinge | null |
+| horizontal_push | horizontal_push | null |
+| vertical_push | vertical_push | null |
+| horizontal_pull | horizontal_pull | null |
+| vertical_pull | vertical_pull | null |
+| single_leg | lunge_unilateral_leg | null |
+| core_anti_extension | isolation | abs |
+| core_anti_rotation | isolation | abs |
+| arm_elbow_flexion | isolation | biceps |
+| arm_elbow_extension | isolation | triceps |
+| lateral_deltoid | isolation | side_delt |
+| rear_deltoid | isolation | rear_delt |
+| calf_plantarflexion | isolation | calf |
+
+Contract rule: every internal `movementIntent` value MUST map to exactly one PRD slot taxonomy row above, and every emitted slot/reason object must include both `movementIntent` and `prdSlotTaxonomy` fields.
 
 ### 2.A.2 Split templates by days/week (PRD-exact)
 - 2 days/week: Full Body A/B.
@@ -568,6 +592,23 @@ Movement coverage summary output:
 ### 2.B.1 Recommendation precedence (strict order)
 `pain/safety -> reduce -> hold -> increase -> default hold/add reps`.
 
+
+### 2.B.1.A Pain-location suppression mapping (machine-testable)
+
+| painLocation | suppressedMuscles | suppressedMovements | substitutionRequiredForEligibleExercises | progressionSuppressed |
+|---|---|---|---|---|
+| shoulder | [chest,shoulders,back_compound_pull,triceps_overhead_loaded] | [horizontal_push,vertical_push,horizontal_pull,vertical_pull_overhead_loaded] | true | true |
+| elbow | [biceps,triceps,loaded_grip_pull] | [horizontal_pull,vertical_pull,arm_elbow_flexion,arm_elbow_extension] | true | true |
+| wrist | [loaded_pressing,loaded_pulling] | [horizontal_push,vertical_push,horizontal_pull,vertical_pull] | true | true |
+| lower_back | [posterior_chain_loaded,spinal_loading] | [hip_hinge,knee_dominant_squat,loaded_standing] | true | true |
+| upper_back | [rows,pull_ups,loaded_carries] | [horizontal_pull,vertical_pull,loaded_carry] | true | true |
+| hip | [squat_pattern,hinge_pattern,lunge_pattern] | [knee_dominant_squat,hip_hinge,single_leg] | true | true |
+| knee | [squat_pattern,lunge_pattern,leg_extension,leg_press] | [knee_dominant_squat,single_leg] | true | true |
+| ankle | [squat_pattern,lunge_pattern,calf,loaded_standing] | [knee_dominant_squat,single_leg,calf_plantarflexion,loaded_standing] | true | true |
+| other | [] | [] | false | false |
+
+Application rules: mapping is applied to exercise eligibility filtering, substitution candidate retrieval, and progression recommendation suppression; `other` does not auto-suppress but emits review prompt.
+
 ### 2.B.2 Load increase threshold
 All conditions required:
 - all planned working sets completed.
@@ -576,11 +617,35 @@ All conditions required:
 - fatigue not high.
 - no form breakdown.
 
-### 2.B.3 Hold and reduce thresholds
-Hold and reduce thresholds MUST match PRD v0.6 exact definitions; no two-exposure RIR-band replacement permitted.
+RIR-enabled behavior:
+- 1–3 RIR supports normal load increase when other increase conditions pass.
+- 0 RIR paired with high fatigue forces hold recommendation.
+- 4+ RIR can still support load increase; explanation must note effort was easier than target.
 
-### 2.B.4 Deload threshold and application
-Deload recommendation threshold: at least 3 of 5 PRD deload signals within trailing 7 days.
+### 2.B.3 Hold threshold
+Suggest hold when any are true (and reduce / safety did not fire):
+- user did not reach top reps on most sets.
+- user recently increased load and reps dropped but stayed in range.
+- fatigue high.
+- logging incomplete.
+- RIR missing and readiness unclear.
+
+### 2.B.4 Reduce threshold
+Suggest reduce when any are true (and safety did not fire):
+- reps below minimum target on 2+ working sets.
+- total reps drop approximately 20% at the same load across comparable sessions.
+- user reports form breakdown.
+
+Pain is handled by precedence step 1 and is not duplicated in reduce-threshold evaluation.
+
+### 2.B.5 Deload threshold and application
+Suggest deload when 3 or more of these 5 signals appear within a trailing 7-day window:
+1. performance decreases across 2 comparable exposures.
+2. fatigue high in 2 or more recent sessions.
+3. soreness high in 2 or more recent sessions.
+4. 2 or more missed workouts after prior consistency.
+5. pain or joint discomfort reported in this window.
+
 Deload is recommendation-only, never auto-applied, and requires explicit user confirmation.
 
 ### 2.B.5 Structured reason object and Why? requirements (PRD)
@@ -820,6 +885,7 @@ Blocking decisions outside this contract (if unresolved in PRD) must remain flag
 - [ ] PRD open decisions either resolved or explicitly listed as blockers.
 
 ### C) Production implementation ready
+- [ ] PRD §0 pre-build gates are passed and signed off; production implementation remains blocked until this is true.
 - [ ] Migration DDL generated exactly from this contract.
 - [ ] RPCs implement all state transitions and idempotency semantics.
 - [ ] Integration/e2e suite passes all §6 tests in CI.
@@ -829,7 +895,7 @@ Blocking decisions outside this contract (if unresolved in PRD) must remain flag
 ## 11) Patch Summary
 - Sections added: §2.A Plan Generator Contract, §2.B Progression and Recommendation Rules.
 - Sections amended: §2.6 exercise_catalog schema, §2.13 set_prescription, §2.15 set_log, §3 API contract, §5 enforcement, §6 acceptance tests, §3.11 local draft recovery.
-- Sections deleted: none.
+- Sections deleted: one summary sentence in §2.B.3 was removed and replaced with full concrete threshold bullets; no implementation-critical rule was removed.
 - Remaining blockers before implementation readiness: endpoint-level request/response JSON schemas must be represented as strict field lists for every endpoint in §3; currently several endpoints remain abbreviated and require full schema expansion.
 
 ## 3.A) Endpoint schema expansion (authoritative supplement to §3.1–§3.11)
@@ -944,3 +1010,47 @@ FK chain validation examples:
 - Given user A token attempts user B row, when endpoint called, then `403 FORBIDDEN_RESOURCE`.
 - Given same user but plan/day mismatch chain, when set log inserted, then `422 FK_OWNERSHIP_VIOLATION`.
 - Given exercise seed load, when validation test runs, then ~80 exercises exist with 6-10 options per movement intent per common equipment profile and all cue/timing fields non-null.
+
+## 3.C) Missing MVP endpoint contracts (authoritative supplement to §3)
+
+### 3.C.1 User profile / onboarding
+- `PUT /v1/user-profile`
+  - Request: `{ versionToken?: number, birthDate?: date|null, sex?: enum|null, heightCm?: number|null, bodyWeight?: number|null, bodyWeightUnit?: kg|lb|null, experienceLevel?: beginner|intermediate|null, timezone: string, onboardingCompletedAt?: timestamptz|null }`
+  - Success: `{ data: { ...userProfile, versionToken:number } }`
+  - Errors: `422` invalid ranges/combinations, `409 VERSION_CONFLICT`, `403` cross-user.
+  - Idempotency/versioning: requires `Idempotency-Key`; create path may omit versionToken, update path requires exact current token.
+  - RLS: only `user_profile.user_id=auth.uid()` row.
+
+### 3.C.2 Goal plan CRUD
+- `POST /v1/goal-plans`, `PATCH /v1/goal-plans/{id}` with strict fields from §2.2.
+- Active-goal uniqueness enforced transactionally; update/archive prior active in same transaction.
+
+### 3.C.3 Equipment profile and items
+- `POST /v1/equipment-profiles`, `PATCH /v1/equipment-profiles/{id}`, `DELETE /v1/equipment-profiles/{id}` (soft-delete/archive only if referenced).
+- `POST /v1/equipment-profiles/{id}/items` request `{ equipmentProfileVersionToken:number, equipmentKey:string }`.
+- Delete item endpoint in §3.9 remains authoritative; add endpoint follows same parent token bump semantics.
+
+### 3.C.4 Exercise catalog read APIs
+- `GET /v1/exercises?movementIntent=&equipmentKey=&limit=&cursor=` and `GET /v1/exercises/{id}`.
+- Read-only through API proxy to seed tables; direct client table access is allowed only read (`is_active=true`) under RLS.
+
+### 3.C.5 Exercise preference CRUD
+- `POST /v1/exercise-preferences`, `PATCH /v1/exercise-preferences/{id}`, `DELETE /v1/exercise-preferences/{id}` using §2.7 schema and versionToken for patch/delete.
+
+### 3.C.6 Substitution candidates + apply
+- `POST /v1/substitutions/candidates`
+  - Request: `{ planVersionId:uuid, workoutDayId:uuid, exerciseInstanceId:uuid, context:'future_plan'|'scheduled_session', painLocation?:pain_location[], unavailableEquipmentKeys?:string[], versionToken:number }`
+  - Success: `{ data:{ candidates:[{ exerciseCatalogId:uuid, score:number, whyThisSubstitution:{ movementIntentMatch:boolean, equipmentCompatible:boolean, painSuppressionApplied:boolean, fatigueComparison:string, historyLoadHint?:string|null } }], suppressedByPainMapping:boolean } }`
+- `POST /v1/substitutions/apply`
+  - Request: `{ targetContext:'future_plan'|'session_override', planVersionId:uuid, workoutDayId?:uuid, workoutSessionId?:uuid, exerciseInstanceId:uuid, replacementExerciseCatalogId:uuid, versionToken:number }`
+  - Success: `{ data:{ substitutionId:uuid, mutationType:'replace_future_exercise_instance'|'session_level_override', newExerciseInstanceId?:uuid, preservedOriginalExerciseInstanceId:uuid } }`
+  - Mutation rule: future-plan applies by creating replacement `exercise_instance` row and retiring original from future view; session override writes to `session_exercise_override` view/RPC result only. Completed workout history and completed set logs are never rewritten.
+
+### 3.C.7 Recommendation action ignoredReason other text
+- `POST /v1/recommendations/{id}/ignore` request extends to `{ versionToken:number, ignoredReason:enum, ignoredReasonText?:string|null }`; `ignoredReasonText` required when `ignoredReason='other'`.
+
+### 3.C.8 Transaction/RPC notes for endpoint groups
+- Workout-session status transitions are RPC-only (`rpc_transition_workout_session`).
+- Recommendation accept/ignore/dismiss are RPC-only (`rpc_apply_recommendation_action`).
+- Set logs are append/idempotent insert only via RPC (`rpc_append_set_logs`); no client update/delete contract.
+
