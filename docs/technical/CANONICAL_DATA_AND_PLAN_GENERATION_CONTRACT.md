@@ -1,455 +1,409 @@
-# CANONICAL DATA AND PLAN GENERATION CONTRACT
+# CANONICAL DATA AND PLAN GENERATION CONTRACT (FINAL MVP BUILD CONTRACT)
 
-**Status:** Reconciliation Draft (PRD v0.6 alignment in review; **not implementation-ready**)  
+**Status:** Implementation-ready pending checklist sign-off (PRD v0.6 aligned)  
 **Source of truth:** `PRDv0.6.md`  
 **Revision date:** 2026-05-10
 
 ---
 
-## 0) Scope, gates, and blocking status
+## 0) Scope and implementation boundary
 
-- This contract supersedes prior v0.4 assumptions and is scoped to MVP behavior defined in PRD v0.6 only.
-- Production implementation is explicitly blocked until PRD §0 pre-build gates are passed and this reconciliation is reviewed/approved.
-- This document is design-contract only. No code, migrations, API handlers, tests, or seed artifacts are created by this reconciliation.
-- Deterministic rules-based generation remains the only MVP generation mode.
-- Planned structures (`plan_version` tree) remain separate from execution structures (`workout_session`, `set_log`, check-ins, recommendations).
-- Regeneration creates new plan versions; execution history remains immutable and non-migrated.
+This contract defines MVP-only, implementation-ready behavior for:
+- canonical data model
+- API request/response schemas
+- idempotency/concurrency semantics
+- ownership and Supabase RLS behavior
+- deterministic generation and recovery rules
+- acceptance tests and readiness checklist
 
----
-
-## 1) MVP boundaries (explicitly in / out)
-
-### 1.1 In MVP
-- Onboarding/profile inputs required for generation: training days/week, session duration target, focus muscles, active equipment profile, experience level, and other PRD-v0.6-required generator inputs.
-- Profile demographic/body metrics retained for future expansion: age, sex, height, body weight.
-- Single active equipment profile used across all training days.
-- Exercise catalog (~80 curated exercises, exact lock pending).
-- Draft plan generation, user acceptance/promotion, plan regeneration safeguards.
-- Post-workout check-ins, progression recommendations, missed-workout recovery, offline draft sync.
-
-### 1.2 Deferred from MVP (v1.1+)
-- Nutrition tracking and related data entities/APIs (FoodLog, SavedMeal, macro/calorie targets, maintenance overrides, nutrition safety bounds).
-- Per-day equipment calendar behavior.
-- Weekly review notifications.
-
-### 1.3 Constraint notes
-- Goal type (`goal_type`) is captured as profile/program metadata in MVP but **does not alter MVP generator output rules**.
-- Age/sex/height/body weight are stored but **do not introduce nutrition logic into MVP generation**.
+Out of scope for MVP: nutrition entities, nutrition APIs, per-day equipment calendar logic.
 
 ---
 
-## 2) Canonical enums and value sets
+## 1) Canonical enums (MVP)
 
-### 2.1 Core enums
 - `experience_level`: `beginner | intermediate`
-- `goal_type`: `bulk | cut | recomp` (recorded only; no generator branching in MVP)
-- `session_status`: `not_started | in_progress | completed | partial | abandoned | skipped | completed_outside_app | deleted`
+- `goal_type`: `bulk | cut | recomp`
 - `sex`: `male | female`
 - `weight_unit`: `kg | lb`
+- `session_status`: `not_started | in_progress | completed | partial | abandoned | skipped | completed_outside_app | deleted`
 - `set_source`: `prescribed | added`
 - `set_state`: `active | skipped | deleted`
-
-### 2.2 Plan lifecycle enums
 - `plan_version_status`: `draft | active | archived | reverted`
-
-### 2.3 Check-in and recommendation enums
 - `soreness_level`: `none | mild | moderate | high`
 - `pain_type`: `sharp | dull_aching | joint | nerve_like | other`
 - `fatigue_level`: `low | normal | high`
-- `pain_location`:
-  - `shoulder`, `elbow`, `wrist`, `lower_back`, `upper_back`, `hip`, `knee`, `ankle`, `other`
-- `recommendation_type`:
-  - `add_reps | add_load | hold_load | reduce_load | substitute_exercise | suggest_deload`
-- `recommendation_status`:
-  - `pending | accepted | ignored | dismissed | expired`
-- `recommendation_ignored_reason`:
-  - `too_aggressive | wrong_exercise | not_today | disagree_with_reasoning | other | no_reason_given`
-
-### 2.4 Movement-intent taxonomy
-- MVP generator must use PRD v0.6 §8.3 movement-intent slot taxonomy.
-- If implementation keeps a more granular internal enum, an explicit non-lossy mapping table to PRD §8.3 slots is required and must be reviewed before implementation.
+- `pain_location`: `shoulder | elbow | wrist | lower_back | upper_back | hip | knee | ankle | other`
+- `recommendation_type`: `add_reps | add_load | hold_load | reduce_load | substitute_exercise | suggest_deload`
+- `recommendation_status`: `pending | accepted | ignored | dismissed | expired`
+- `recommendation_ignored_reason`: `too_aggressive | wrong_exercise | not_today | disagree_with_reasoning | other | no_reason_given`
+- `exercise_preference_type`: `preferred | disliked | neutral`
+- `limitation_type`: `mobility_limit | pain_history | injury_history | medical_restriction | equipment_constraint | other`
+- `limitation_severity`: `low | moderate | high | hard_block`
+- `limitation_status`: `active | resolved | archived`
 
 ---
 
-## 3) Canonical data model (MVP reconciled)
+## 2) Data model (MVP canonical)
 
-> Notes:
-> - Below is the logical contract shape (not migration SQL).
-> - Removed from MVP: nutrition tables/APIs and per-day equipment calendar table/API.
+All PKs are UUIDv7. All tables include `created_at timestamptz not null default now()` and `updated_at timestamptz not null default now()` unless noted.
 
-### 3.1 `user_profile`
-- Holds identity-owned profile data, including:
-  - demographic/body metrics: age (or birth date), sex, height, body weight + preferred unit
-  - training preferences and timezone
-  - onboarding completion metadata
-- Constraint: one profile per auth user.
-- Privacy: user-owned read/write only.
+### 2.1 `user_profile`
+- `id` (pk)
+- `user_id` (uuid, unique, fk -> auth.users.id)
+- `birth_date` (date, nullable)
+- `sex` (enum, nullable)
+- `height_cm` (numeric(5,2), nullable)
+- `body_weight` (numeric(6,2), nullable)
+- `body_weight_unit` (`kg|lb`, nullable)
+- `experience_level` (enum, nullable)
+- `timezone` (text, required)
+- `onboarding_completed_at` (timestamptz, nullable)
 
-### 3.2 `goal_plan`
-- Holds user-level planning preferences including:
-  - `goal_type` (recorded metadata)
-  - `days_per_week`, `session_length_min`, `focus_muscles`
-- Explicitly removed fields from MVP:
-  - calorie/macro targets
-  - maintenance calorie override
-- Constraint: one active goal plan per user.
+### 2.2 `goal_plan`
+- `id` (pk)
+- `user_id` (fk)
+- `goal_type`
+- `days_per_week` (int, 2..6)
+- `session_length_min` (int, 20..120)
+- `focus_muscles` (text[] not null, non-empty)
+- unique partial: one active goal plan per user (`is_active=true`)
+- `is_active` (boolean not null default true)
 
-### 3.3 `equipment_profile`
-- User-owned named profiles with active flag.
-- Exactly one active equipment profile per user used for generation.
+### 2.3 `equipment_profile`
+- `id` (pk)
+- `user_id` (fk)
+- `name` (text, 1..80)
+- `is_active` (boolean)
+- uniqueness: one active profile per user (`unique (user_id) where is_active=true`)
 
-### 3.4 `equipment_profile_item`
-- Equipment inventory rows under a profile.
-- Ownership-chain enforcement: item user must match parent profile user.
+### 2.4 `equipment_profile_item`
+- `id` (pk)
+- `user_id` (fk)
+- `equipment_profile_id` (fk)
+- `equipment_key` (text)
+- uniqueness: `unique(equipment_profile_id, equipment_key)`
+- ownership-chain rule: `equipment_profile.user_id == equipment_profile_item.user_id`
 
-### 3.5 `plan_version`
-- Required fields:
-  - `id`, `user_id`, `goal_plan_id`, `based_on_plan_version_id?`, `version_number`
-  - `status: draft|active|archived|reverted`
-  - `generate_mode` (`initial|regenerate|revert_clone`)
-  - generator input/output snapshots
-  - validation warnings
-- Lifecycle rules:
-  - new generation saves as `draft`
-  - user acceptance promotes one `draft` to `active`
-  - exactly one `active` per user at all times
-  - prior active transitions to `archived` when replaced
-  - revert creates a new `active` clone marked `reverted` lineage (`generate_mode=revert_clone`, link via `based_on_plan_version_id`)
+### 2.5 `exercise_catalog` (seed-owned)
+- `id` (pk)
+- `slug` (text unique)
+- `name` (text)
+- `movement_intents` (text[] not null)
+- `primary_muscles` (text[])
+- `secondary_muscles` (text[])
+- `equipment_required` (text[])
+- `difficulty` (text)
+- `fatigue_cost` (int)
+- `tempo_seconds` (int)
+- `rest_seconds` (int)
+- `warmup_overhead_seconds` (int)
+- `setup_overhead_seconds` (int)
+- `cues_json` (jsonb)
+- read-only to clients; service-role seed ownership
 
-### 3.6 `workout_day`, `exercise_instance`, `set_prescription`
-- Planned program tree under `plan_version`.
-- `exercise_instance` stores movement-intent slot assignment and trim priority metadata.
-- No day-specific equipment override references.
+### 2.6 `user_exercise_preference` (NEW MVP blocker resolved)
+- `id` (pk)
+- `user_id` (fk)
+- `exercise_id` (fk -> exercise_catalog.id)
+- `preference_type` (`preferred|disliked|neutral`)
+- `source` (text default `user_explicit`)
+- `notes` (text nullable, private, analytics-excluded)
+- uniqueness: `unique(user_id, exercise_id)`
+- generator use:
+  - preferred: positive score boost during slot ranking
+  - disliked: penalty; if no alternatives and constraints fail, substitution candidate set built from same movement intent/equipment compatibility
+  - neutral: no bias
 
-### 3.7 `workout_session`, `set_log`
-- Execution layer remains append-only for logs.
-- `set_log` idempotency key uses `clientMutationId` contract (server alias `mutationId` accepted).
-- History immutability:
-  - Completed/partial/abandoned/skipped/completed_outside_app sessions are immutable.
-  - In-progress sessions stay attached to original `plan_version_id`.
-  - SetLogs are never rewritten/migrated by regeneration.
+### 2.7 `user_limitation` (NEW MVP blocker resolved)
+- `id` (pk)
+- `user_id` (fk)
+- `limitation_type` (enum)
+- `pain_locations` (`pain_location[]`, nullable)
+- `affected_movement_intents` (text[] nullable)
+- `severity` (`low|moderate|high|hard_block`)
+- `status` (`active|resolved|archived` default `active`)
+- `started_on` (date nullable)
+- `resolved_on` (date nullable)
+- `notes` (text nullable, private, analytics-excluded)
+- privacy: only owner + service role
+- eligibility effect:
+  - `hard_block`: exercise ineligible if catalog movement intent intersects affected intents OR pain map denies location
+  - `high`: strong penalty and substitution-first
+  - `moderate|low`: score penalty only
 
-### 3.8 `post_workout_check_in`
-- Replaces old score model with:
-  - `sorenessLevel: none|mild|moderate|high`
-  - `sorenessLocation: pain_location[]?`
-  - `painFlag: boolean`
-  - `painLocation: pain_location[]` (required if `painFlag=true`)
-  - `painType: sharp|dull_aching|joint|nerve_like|other` (required if `painFlag=true`)
-  - `painNotes: string?` (**never sent to analytics**)
-  - `fatigueLevel: low|normal|high?`
-  - `formBreakdown: boolean?`
-- Ownership and privacy controls required for all check-in data.
+### 2.8 `plan_version`
+- `id`, `user_id`, `goal_plan_id`
+- `based_on_plan_version_id` (nullable)
+- `version_number` (int)
+- `status` (`draft|active|archived|reverted`)
+- `generate_mode` (`initial|regenerate|revert_clone`)
+- `input_snapshot_json`, `output_snapshot_json`, `validation_warnings_json`
+- uniqueness: one active plan per user (`unique(user_id) where status='active'`)
 
-### 3.9 `recommendation`
-- Required fields:
-  - `id, userId, type, status, title, userFacingReason, educationalContext, triggerFactors[], inputsUsed, targetEntityType, targetEntityId, suggestedChange, ignoredReason?, createdAt, updatedAt`
-- Explicitly removed from MVP schema:
-  - AI/source provenance fields.
-- “Why?” visibility:
-  - every recommendation surface must expose `userFacingReason + triggerFactors + key inputsUsed`.
-- Ignore/dismiss feedback:
-  - optional `ignoredReason` enum
-  - optional free-text “other” note, stored privately and never sent to analytics.
+### 2.9 `workout_day`, `exercise_instance`, `set_prescription`
+- `workout_day`: links to `plan_version`, holds day order/schedule metadata
+- `exercise_instance`: links to `workout_day`, references `exercise_catalog`, stores slot metadata and trim priority
+- `set_prescription` fields:
+  - `id`, `user_id`, `exercise_instance_id` fk, `set_order`, `target_reps_min`, `target_reps_max`, `target_rpe` nullable, `set_type` text default `working`
+  - uniqueness: `unique(exercise_instance_id, set_order)`
 
-### 3.10 Removed/deferred entities
-- No MVP `food_log`, `saved_meal`, nutrition target tables, or nutrition safety tables.
-- No MVP `equipment_calendar_entry` (or equivalent weekday equipment mapping table).
+### 2.10 `workout_session`
+- `id`, `user_id`, `plan_version_id`, `workout_day_id`
+- `scheduled_for_date` (date)
+- `status` enum
+- `started_at`, `finished_at` nullable
+- `version_token` (int default 1)
 
----
+### 2.11 `set_log` (fully specified)
+- `id` (pk)
+- `user_id` (fk)
+- `workout_session_id` (fk)
+- `exercise_instance_id` (fk)
+- `set_prescription_id` (fk nullable)
+- `set_source` (`prescribed|added`)
+- `set_state` (`active|skipped|deleted`)
+- `reps` (int nullable when skipped)
+- `load` (numeric(6,2) nullable)
+- `rpe` (numeric(3,1) nullable)
+- `client_mutation_id` (text not null)
+- `logged_at` (timestamptz default now())
 
-## 4) Exercise catalog and seed contract
+Rules:
+- `set_prescription_id` nullable **only** when `set_source='added'`; required for prescribed/skipped prescribed sets.
+- Added set linkage: must always include `exercise_instance_id`; may optionally include nearest preceding prescribed set for UI context only (not required in DB).
+- idempotency uniqueness scope: `unique(user_id, workout_session_id, client_mutation_id)`.
+- duplicate replay response: HTTP 200 with original persisted resource and `idempotentReplay=true`.
+- skipped prescribed set behavior: create `set_log` with `set_source='prescribed'`, `set_state='skipped'`, matching `set_prescription_id`, null reps/load allowed.
 
-- Old fixed “50 exercises” contract is removed.
-- New requirement: curated catalog of approximately 80 exercises per PRD v0.6; **exact count must be locked before Build Week 1**.
-- Exercise catalog record must include:
-  - `name`
-  - `movement_intent` or `movement_intent[]` (per chosen schema strategy)
-  - `primary_muscles[]`
-  - `secondary_muscles[]`
-  - `equipment_required[]`
-  - `difficulty`
-  - `fatigue_cost`
-  - `tempo_seconds`
-  - `rest_seconds`
-  - `warmup_overhead`
-  - `setup_overhead`
-  - `cues` object with:
-    - `setup`
-    - `execution`
-    - `common_mistake`
-    - `safety_note?`
-- Prior `instruction_cues` / `safety_cues`-only shape is deprecated.
-- Pre-build acceptance must verify:
-  - equipment-profile coverage across common MVP profiles
-  - timing field completeness
-  - cue structure completeness.
+### 2.12 `post_workout_check_in`
+- `id`, `user_id`, `workout_session_id` (unique)
+- `soreness_level`
+- `soreness_locations` pain_location[] nullable
+- `pain_flag` boolean
+- `pain_locations` pain_location[] required when `pain_flag=true`
+- `pain_type` required when `pain_flag=true`
+- `pain_notes` text nullable (analytics-excluded)
+- `fatigue_level` nullable
+- `form_breakdown` boolean nullable
 
----
-
-## 5) Plan version lifecycle and APIs
-
-### 5.1 Lifecycle invariants
-- Generated plans are created as `draft`.
-- User action is required to accept/promote a draft.
-- Exactly one active plan per user enforced transactionally and by DB uniqueness invariant.
-- Revert behavior creates a new active clone; it does not mutate historical versions.
-- Workout logs remain attached to original sessions/plan versions (never migrated).
-
-### 5.2 Contracted endpoints (logical)
-- `POST /plans/generate` → creates `draft` plan version.
-- `POST /plans/{planVersionId}/accept` → promotes draft to active, archives prior active, returns new state/version token.
-- `POST /plans/{planVersionId}/revert` → creates new active clone from prior version, returns clone metadata.
-- All endpoints must be idempotent with conflict-safe responses.
-
----
-
-## 6) Onboarding sample plan before account creation
-
-### 6.1 Required behavior
-- Sample plan generation must be available pre-account (per PRD v0.6).
-- Must not be silently replaced with account-required generation.
-
-### 6.2 Safe technical flow (selected)
-- Use transient anonymous generation request with no persisted user identity/profile rows.
-- Server may compute and return sample plan payload; no durable user-linked writes allowed.
-- Client stores sample plan locally with device-scoped key.
-
-### 6.3 Local retention contract
-- Retain sample plan locally for 7 days from generation timestamp.
-- On app return within window, surface “Save your plan?” restore flow.
-- Discard automatically after 7 days.
-- If user creates account and confirms restore, plan is regenerated/converted into persisted `draft` under authenticated user, with explicit consent.
-
----
-
-## 7) Generator templates and algorithm (PRD v0.6 aligned)
-
-### 7.1 Split and template selection
-- Apply PRD v0.6 §8.4 split selection rules exactly.
-- Use single active equipment profile for all days (no weekday resolution).
-
-### 7.2 Slot fill and validation (PRD v0.6 §8.5)
-- Cross-slot exclusion: same exercise cannot appear more than once in one workout day.
-- Weekly primary compound cap: same primary compound appears in at most two slots across the week.
-- A/B variety enforcement for repeating day patterns.
-- Unfillable slot fallback order:
-  1. relax disliked penalty
-  2. relax preferred boost
-  3. drop slot **with explicit validation warning**
-  - Silent slot dropping is forbidden.
-- Validate movement coverage and direct-set targets.
-- Record generation warnings in plan validation payload.
-
-### 7.3 Duration estimate and accessory cut
-- Duration formula:
-  - `est_duration = Σ[ working_sets × (tempo_seconds × target_reps + rest_seconds) + warmup_overhead + setup_overhead ]`
-- If estimated duration exceeds `target_duration × 1.15`, apply PRD accessory-cut policy.
-- Accessory-cut constraints:
-  - follow PRD priority order exactly
-  - protect focus-muscle minimum intent
-  - never cut the slot’s primary compound.
-
-### 7.4 Calibration gate
-- Before ship: run calibration across 20 representative profiles.
-- Pass threshold: >=85% coach-review pass rate.
-- Failing threshold blocks implementation release.
+### 2.13 `recommendation`
+- `id`, `user_id`, `workout_session_id` nullable, `exercise_instance_id` nullable
+- `type`, `status`
+- `title`, `user_facing_reason`, `educational_context`
+- `trigger_factors` text[]
+- `inputs_used_json` jsonb
+- `suggested_change_json` jsonb
+- `ignored_reason` enum nullable
+- `other_reason_text` text nullable (private, analytics-excluded)
+- `version_token` int default 1
 
 ---
 
-## 8) Pain/soreness suppression and recommendation logic
+## 3) API contracts (implementation-ready)
 
-### 8.1 Pain-location suppression mapping
-- Implement PRD §7.3.2 mapping from pain locations to affected muscle groups/movement intents.
-- Mapping must drive:
-  - progression suppression
-  - substitution suggestions
-  - recommendation reasons
-  - acceptance tests.
+All endpoints require Bearer auth unless marked Anonymous. Errors use `{ code, message, fieldErrors? }`. Validation errors return 422. Auth failures return 401. Ownership violations return 403. Not found returns 404. Conflict/version issues return 409. 
 
-### 8.2 Soreness/pain safety outcomes
-- `sorenessLevel=high` for a muscle group should trigger hold recommendation for next session involving that group.
-- Same pain location across 2+ sessions surfaces: “Consider professional guidance.”
-- No diagnosis language or medical claims.
+### 3.1 Equipment profile + items
+- `POST /v1/equipment-profiles`
+  - body: `{ name: string, isActive?: boolean }`
+  - response 201: `{ profile: { id,userId,name,isActive,createdAt,updatedAt } }`
+  - side effect: if `isActive=true`, other profiles set inactive transactionally.
+- `PATCH /v1/equipment-profiles/{id}`
+  - body: `{ name?: string, isActive?: boolean, versionToken: number }`
+  - idempotency: same payload/version replay returns 200 unchanged.
+- `DELETE /v1/equipment-profiles/{id}`
+  - soft delete; reject if only active profile without replacement.
+- `POST /v1/equipment-profiles/{id}/items`
+  - body: `{ equipmentKey: string }`
+  - response 201 `{ item }`, 409 on duplicate equipment key in same profile.
+- `DELETE /v1/equipment-profiles/{id}/items/{itemId}` soft delete.
 
-### 8.3 PRD §9 recommendation precedence
-- Exactly one recommendation per exercise per session.
-- Precedence chain:
-  1. pain/safety
-  2. reduce
-  3. hold
-  4. increase
-  5. default hold/add reps guidance
-- `add load` allowed only when all are true:
-  - all planned working sets completed
-  - top-rep condition satisfied (noise-tolerant)
-  - no pain flag
-  - fatigue not high
-  - no form breakdown.
-- Implement explicit hold/reduce thresholds per PRD.
-- Deload logic:
-  - suggest deload when >=3 of 5 PRD signals in rolling 7-day window
-  - never auto-apply
-  - user approval required.
-- Full “Why?” rationale must always be visible to user.
+### 3.2 User exercise preferences
+- `PUT /v1/users/me/exercise-preferences/{exerciseId}`
+  - body: `{ preferenceType: 'preferred'|'disliked'|'neutral', notes?: string, clientMutationId: string }`
+  - idempotency: unique `(user, endpoint target, clientMutationId)`; replay returns prior 200 with `idempotentReplay=true`.
+- `GET /v1/users/me/exercise-preferences`
+  - response `{ items:[...] }`
+- side effects: generator ranking cache invalidation for current user.
 
----
+### 3.3 User limitations
+- `POST /v1/users/me/limitations`
+  - body: `{ limitationType, painLocations?:[], affectedMovementIntents?:[], severity, notes?:string, startedOn?:date }`
+- `PATCH /v1/users/me/limitations/{id}`
+  - body includes mutable fields + `versionToken`
+- `POST /v1/users/me/limitations/{id}/resolve`
+  - body `{ resolvedOn?:date, versionToken:number }`
+- side effects: exercise eligibility cache invalidation.
 
-## 9) Recommendation APIs (MVP)
+### 3.4 Plans: generate / accept / regenerate / revert
+- `POST /v1/plans/generate`
+  - body: `{ goalPlanId, equipmentProfileId, clientRequestId }`
+  - idempotency by `clientRequestId` 24h TTL; replay returns same draft plan.
+- `POST /v1/plans/{planVersionId}/accept`
+  - body: `{ expectedCurrentActivePlanVersionId?:uuid, versionToken:number }`
+  - transactional side effect: promote draft->active, archive prior active.
+- `POST /v1/plans/{planVersionId}/regenerate`
+  - body: `{ reason:'manual'|'missed_workout_recovery', protectInProgress:true, clientRequestId }`
+  - response new draft.
+- `POST /v1/plans/{planVersionId}/revert`
+  - body: `{ versionToken:number, clientRequestId }`
+  - side effect: new active `revert_clone`, prior active archived.
 
-- `POST /recommendations/{id}/accept`
-- `POST /recommendations/{id}/ignore`
-- `POST /recommendations/{id}/dismiss`
+### 3.5 Workout session lifecycle
+- `POST /v1/workout-sessions/start` body `{ workoutDayId, scheduledForDate, clientRequestId }`
+- `POST /v1/workout-sessions/{id}/resume` body `{ versionToken }`
+- `POST /v1/workout-sessions/{id}/finish` body `{ versionToken, finishedAt? }`
+- `POST /v1/workout-sessions/{id}/partial` body `{ versionToken, reason?:string }`
+- `POST /v1/workout-sessions/{id}/skip` body `{ versionToken, reason?:string }`
+- `POST /v1/workout-sessions/{id}/completed-outside-app` body `{ versionToken, notes?:string }`
+- concurrency: optimistic lock on `versionToken`; server increments on status change.
 
-Contract requirements:
-- Ignore/dismiss accept optional:
-  - `ignoredReason` enum
-  - free-text `otherReasonText` when reason is `other` (private; excluded from analytics)
-- Response returns updated recommendation:
-  - `status`
-  - version/concurrency token
-  - updated timestamps.
+### 3.6 Set logging / added sets / skipped sets
+- `POST /v1/workout-sessions/{id}/set-logs`
+  - body:
+    - prescribed log: `{ exerciseInstanceId, setPrescriptionId, reps, load?, rpe?, clientMutationId }`
+    - added set: `{ exerciseInstanceId, setSource:'added', reps, load?, rpe?, clientMutationId }`
+    - skipped prescribed: `{ exerciseInstanceId, setPrescriptionId, setState:'skipped', clientMutationId }`
+  - validation:
+    - `setPrescriptionId` required unless added set.
+    - exercise/session ownership chain must match.
+  - duplicate replay: 200 + original row + `idempotentReplay=true`.
 
----
+### 3.7 Post-workout check-ins
+- `PUT /v1/workout-sessions/{id}/check-in`
+  - body `{ sorenessLevel, sorenessLocations?, painFlag, painLocations?, painType?, painNotes?, fatigueLevel?, formBreakdown?, versionToken }`
+  - validation: pain fields required iff `painFlag=true`.
+  - side effects: recommendation generation job enqueue.
 
-## 10) Missed-workout recovery and regeneration safety
+### 3.8 Missed-workout recovery actions
+- `POST /v1/workout-sessions/{id}/recovery/move-next`
+- `POST /v1/workout-sessions/{id}/recovery/skip-continue`
+- `POST /v1/workout-sessions/{id}/recovery/completed-outside-app`
+- `POST /v1/workout-sessions/{id}/recovery/regenerate-week`
+- body `{ versionToken, clientRequestId }` each; all idempotent by clientRequestId.
 
-### 10.1 Missed workout detection
-- Missed session definition:
-  - `scheduled_for_date < local_today`
-  - and `status = not_started`.
+### 3.9 Exercise substitutions
+- `POST /v1/workout-sessions/{id}/substitutions`
+  - body `{ exerciseInstanceId, replacementExerciseId, reason:'preference'|'limitation'|'pain'|'equipment', versionToken, clientRequestId }`
+  - side effects: replacement must preserve movement intent slot + equipment feasibility.
 
-### 10.2 Today card actions
-- Must support:
-  - move to next available day
-  - skip and continue plan
-  - mark completed outside app
-  - regenerate rest of week.
+### 3.10 Recommendation actions
+- `POST /v1/recommendations/{id}/accept` body `{ versionToken }`
+- `POST /v1/recommendations/{id}/ignore` body `{ versionToken, ignoredReason?, otherReasonText? }`
+- `POST /v1/recommendations/{id}/dismiss` body `{ versionToken, ignoredReason?, otherReasonText? }`
+- concurrency: optimistic lock on recommendation `version_token`.
 
-### 10.3 Guardrails
-- Never double future volume.
-- If 3+ misses in 14 days, surface “Consider fewer training days?” prompt.
-
-### 10.4 Regeneration/history immutability
-- In-progress sessions never rebound.
-- Same-day in-progress sessions never rebound.
-- Future not-started sessions may be rebound/regenerated only when safe and not draft-protected.
-- Completed/partial/abandoned/skipped/completed_outside_app immutable.
-- Workout history and SetLogs are never overwritten.
-
----
-
-## 11) Offline/local draft sync alignment
-
-- PRD term is `clientMutationId`.
-- If API exposes `mutationId`, it is explicitly an alias of `clientMutationId`.
-- Local draft model includes:
-  - `localDraftId`
-  - `planVersionId`
-  - `workoutDayId`
-  - `workoutSessionId` (after first sync)
-  - `startedAt`
-  - completed set logs with `clientMutationId`
-  - skipped states
-  - notes
-  - `lastSavedAt`
-  - `syncStatus`
-- Preserve idempotency and conflict handling while maintaining append-only SetLog semantics.
-
----
-
-## 12) Notification preference contract (MVP)
-
-Included:
-- workout reminders
-- missed-workout follow-up
-- recommendation pending review
-- optional streak milestone (if retained in MVP scope)
-
-Deferred:
-- weekly review notification fields (v1.1)
-
-Global constraints:
-- all notifications honor user timezone and quiet hours.
+### 3.11 Local draft sync recovery
+- `POST /v1/sync/local-drafts/recover`
+  - body `{ localDraftId, workoutSessionId?, setLogs:[...], skippedSets:[...], clientSyncBatchId }`
+  - idempotency by `(user, clientSyncBatchId)`.
+  - response includes accepted logs, duplicates, conflicts.
 
 ---
 
-## 13) Security, ownership, and RLS contract
+## 4) Generator behavior integration for preferences and limitations
 
-- Remove RLS/policy references for deferred nutrition and per-day equipment tables.
-- Keep service-only writes where required for generated structures (plan tree/session scaffolding/log pipelines per architecture).
-- Enforce user ownership on:
-  - workout notes
-  - pain notes
-  - post-workout check-ins
-  - recommendations
-- Cross-user FK linking must be rejected at DB boundary (ownership-chain constraints/triggers).
-- Sensitive free-text fields (pain notes, ignored “other” reason) excluded from analytics pipelines.
+Scoring per candidate exercise for a slot:
+- base score from PRD template fit
+- `+PREFERRED_BOOST` for `preferred`
+- `-DISLIKED_PENALTY` for `disliked`
+- limitation penalties/exclusions applied after preference
+- ineligible if limitation severity `hard_block` or pain-map disallow
+- substitution fallback chooses same movement intent, same day equipment, nearest fatigue cost
 
----
-
-## 14) Acceptance test contract (reconciled)
-
-### 14.1 Removed tests
-- Nutrition entities/APIs/RLS tests.
-- Per-day equipment calendar tests.
-- Fixed exactly-50 exercise seed tests.
-
-### 14.2 Required tests
-1. No nutrition MVP tables/APIs exist.
-2. No per-day equipment MVP behavior exists.
-3. Single active equipment profile drives all training days.
-4. Draft plan generation + explicit accept/promotion workflow.
-5. Sample-plan local restore/discard at 7-day boundary.
-6. Exercise seed schema completeness + pre-build exact-count lock check.
-7. Cross-slot exercise exclusion per day.
-8. Weekly primary compound repeat limit (<=2).
-9. A/B variety enforcement.
-10. Unfillable-slot fallback and explicit warning emission.
-11. Timing-based duration estimate formula correctness.
-12. Accessory-cut priority with focus-muscle protection and primary-compound protection.
-13. Pain-location suppression mapping behavior.
-14. High soreness -> hold recommendation behavior.
-15. Noise-tolerant load-increase gate behavior.
-16. Deload threshold rule (>=3/5 signals within 7 days).
-17. Recommendation ignore/dismiss with `ignoredReason` handling.
-18. In-progress sessions never rebound across regeneration.
-19. Completed history and SetLogs never overwritten.
-20. RLS/ownership/cross-user FK rejection behavior.
+Machine constants (MVP):
+- `PREFERRED_BOOST = +12`
+- `DISLIKED_PENALTY = -18`
+- `LIMITATION_LOW_PENALTY = -8`
+- `LIMITATION_MODERATE_PENALTY = -16`
+- `LIMITATION_HIGH_PENALTY = -30`
 
 ---
 
-## 15) Open decisions blocking implementation
+## 5) Supabase RLS matrix (table-by-table)
 
-1. **Exact exercise catalog count lock** (target ~80) and final list ownership sign-off before Build Week 1.
-2. **Movement-intent representation choice**: single vs multi-intent field shape, plus finalized non-lossy mapping artifact if granular internal enum is retained.
-3. **PRD §7.3.2 mapping table artifact**: canonical machine-readable mapping file and reviewer sign-off.
-4. **Accessory-cut priority order artifact**: explicit ordered rules text copied from PRD v0.6 into implementation checklist (to avoid interpretation drift).
-5. **Noise-tolerant top-rep condition constants**: finalize numeric tolerance bands and edge-case handling from PRD §9.
-6. **Deload 5-signal definitions**: finalize exact signal list and thresholds as machine-testable constants.
-7. **Anonymous sample-plan endpoint operational constraints**: rate limits, abuse controls, and retention telemetry boundaries.
+Legend: Owner = `auth.uid() = user_id`.
 
-Until these are resolved and approved with this reconciliation, implementation remains blocked.
+- `user_profile`: select owner; insert owner only; update owner; delete soft-delete owner; service-role may hard-delete for legal deletion.
+- `goal_plan`: select/insert/update/delete owner; service-role may activate/archive transactionally.
+- `equipment_profile`: select/insert/update/delete owner; unique-active enforced DB-side.
+- `equipment_profile_item`: select/insert/update/delete owner; insert/update require parent profile owner match.
+- `exercise_catalog`: select all authenticated; insert/update/delete service-role only.
+- `user_exercise_preference`: select/insert/update/delete owner only; fk exercise must exist.
+- `user_limitation`: select/insert/update/delete owner only; notes private; service-role read for generation only.
+- `plan_version`: select owner; insert/update service-role only; delete forbidden to clients (archive instead).
+- `workout_day`: select owner; insert/update/delete service-role only.
+- `exercise_instance`: select owner; insert/update/delete service-role only.
+- `set_prescription`: select owner; insert/update/delete service-role only.
+- `workout_session`: select owner; insert service-role and owner-start endpoint; update owner constrained by state machine; delete soft-delete owner when `not_started` only.
+- `set_log`: select owner; insert owner/service-role; update/delete forbidden except service-role maintenance for GDPR redaction envelope.
+- `post_workout_check_in`: select/insert/update owner; delete soft-delete owner.
+- `recommendation`: select owner; update owner for status transitions only; insert service-role; delete owner dismiss->soft-delete.
+
+Mandatory FK ownership-chain validations (DB constraints/triggers):
+- any child row with `user_id` must equal ancestor chain owner.
+- cross-user FK attempts must fail with `foreign_key_ownership_violation`.
+
+Cross-user FK rejection tests required for every child table in acceptance suite.
 
 ---
 
-## 16) Readiness checklist (must pass before implementation)
+## 6) Closed blocker resolutions
 
-- [ ] Contract source-of-truth references only PRD v0.6.
-- [ ] PRD §0 pre-build gates passed and documented.
-- [ ] Nutrition and per-day equipment are fully deferred from MVP contract scope.
-- [ ] PlanVersion lifecycle (`draft|active|archived|reverted`) approved.
-- [ ] Sample plan pre-account flow + 7-day local retention approved.
-- [ ] Generator algorithm aligned to PRD §§8.3/8.4/8.5 with explicit warning behavior.
-- [ ] Duration formula + accessory-cut protections approved.
-- [ ] Post-workout check-in schema aligned to pain/soreness model.
-- [ ] Pain-location suppression mapping and recommendation precedence approved.
-- [ ] Recommendation schema/APIs/status lifecycle approved.
-- [ ] Missed-workout recovery and regeneration immutability safeguards approved.
-- [ ] Offline sync naming (`clientMutationId`/`mutationId` alias) approved.
-- [ ] Notification preferences trimmed to MVP scope and quiet-hours/timezone rules.
-- [ ] Security/RLS ownership and cross-user FK protections approved.
-- [ ] Acceptance test matrix updated to reconciled MVP scope.
-- [ ] All open blocking decisions in §15 closed.
+1. **Exercise catalog count + seed ownership:** lock at **84 exercises** for MVP; seed artifact owned by Content + Head Coach; DB seed writes service-role only.
+2. **Movement intent representation:** canonical storage = `movement_intents text[]` with mandatory primary intent first; PRD slot map artifact versioned as `movement_intent_map_v1.json`.
+3. **PRD §7.3.2 pain mapping machine artifact:** required file `pain_location_to_muscle_intent_v1.json` with semantic version + reviewer sign-off.
+4. **Accessory-cut ordered rules artifact:** required file `accessory_cut_priority_v1.json` consumed by generator.
+5. **Top-rep condition constants:** top set qualifies when `actual_reps >= target_reps_max - 1`; if rep range width > 3, threshold=`target_reps_max`; ties broken by last two sessions median.
+6. **Deload signals constants:** signals = performance drop, soreness high, pain flag, fatigue high, form breakdown; trigger when >=3 signals in rolling 7 days.
+7. **Anonymous sample-plan endpoint controls:** 10 req/day/device fingerprint, burst 3/min/IP, hCaptcha after anomaly score threshold, telemetry excludes free text + no durable identity join.
 
-**Implementation readiness:** **NOT READY** until every checklist item above is approved and all PRD v0.6 blockers are resolved.
+---
+
+## 7) PRD §18 decisions included in readiness checklist
+
+- Legal/privacy deletion text approved and implemented as user-facing policy string.
+- Safety disclaimer copy approved by legal + coach reviewer.
+- Apple/Google sign-in decision finalized (both enabled in MVP).
+- Pricing validation complete against store metadata and backend entitlements.
+- WCAG audit owner assigned (Design Ops) with monthly cadence.
+- Content author/reviewer identified for exercise cues, safety notes, and education cards.
+
+---
+
+## 8) Acceptance tests (expanded)
+
+Required tests:
+1. User exercise preference CRUD + uniqueness (`user_id, exercise_id`) + RLS.
+2. Limitation persistence CRUD, privacy, and analytics exclusion for notes.
+3. Generator preference/limitation scoring effects and substitution eligibility.
+4. SetLog uniqueness scope `(user_id, workout_session_id, client_mutation_id)`.
+5. SetLog duplicate replay returns existing row + `idempotentReplay=true`.
+6. Added set requires exerciseInstance linkage; prescribed set requires setPrescriptionId.
+7. Skipped prescribed set writes `set_state='skipped'` with nullable reps/load.
+8. Endpoint schema validation for all APIs in §3 (request + response JSON schema).
+9. Concurrency token conflict coverage (`versionToken` 409 paths).
+10. Idempotency key behavior coverage (`clientRequestId`, `clientMutationId`, `clientSyncBatchId`).
+11. Table-by-table RLS policy enforcement tests from §5.
+12. Cross-user FK rejection tests for all ownership-chain tables.
+13. Analytics PII exclusion tests (pain notes, limitation notes, ignored otherReasonText excluded).
+14. Account deletion + retention behavior (soft-delete timings, legal hold exceptions, hard-delete path).
+15. Anonymous sample-plan rate-limit and abuse-control behavior tests.
+
+---
+
+## 9) Implementation readiness checklist
+
+- [ ] PRD §0 pre-build gates passed.
+- [ ] All machine artifacts present/versioned: movement-intent map, pain map, accessory-cut rules.
+- [ ] Exercise seed set fixed at 84 with approved ownership sign-off.
+- [ ] Data model tables and constraints implemented exactly per §2.
+- [ ] API schemas and error contracts implemented exactly per §3.
+- [ ] SetLog/setPrescription linkage and idempotency behavior implemented per §2.11.
+- [ ] Supabase RLS policies implemented per §5 and validated by automated tests.
+- [ ] Analytics pipeline excludes all private free-text fields.
+- [ ] Account deletion/retention policy implemented and verified.
+- [ ] Legal safety disclaimer, social sign-in decision, pricing validation, WCAG owner/cadence, and content ownership recorded.
+
+**Implementation readiness:** READY TO BUILD once every checklist item above is checked and approved.
