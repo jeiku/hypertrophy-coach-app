@@ -1,6 +1,6 @@
 # CANONICAL DATA AND PLAN GENERATION CONTRACT
 
-**Status:** Implementation Freeze - Build Ready  
+**Status:** Implementation Freeze - Build Ready (All prior blockers resolved)  
 **Source of truth:** `PRD.md` v0.4 Canonical Draft  
 **Revision date:** 2026-05-10
 
@@ -11,7 +11,7 @@
 - Regeneration always creates a new `plan_version`.
 - Completed history is immutable.
 
-**Implementation blocker:** the canonical 50-exercise seed dataset is **not embedded in this repository/contract text**. Implementation freeze is conditional on supplying exact 50 rows or a checked-in SQL seed file with deterministic IDs/slugs.
+Canonical exercise seed is checked in at `db/seeds/001_exercises_canonical_50.sql` with deterministic UUIDs/slugs and required `instruction_cues` + `safety_cues` fields.
 
 ---
 
@@ -115,6 +115,7 @@ Constraints: unique `(user_id, weekday) where deleted_at is null`.
 - `warnings jsonb not null default '[]'::jsonb`
 - `deleted_at timestamptz null`
 Constraints: unique `(user_id, version_number)`.
+DB invariant: exactly one active non-deleted plan version per user enforced by partial unique index `(user_id) where is_active=true and deleted_at is null`.
 
 ## 2.7 `workout_day`
 - `id uuid pk`
@@ -167,6 +168,10 @@ Constraints: unique `(exercise_instance_id, set_index) where deleted_at is null`
 - `status session_status not null default 'not_started'`
 - `completed_outside_app boolean not null default false`
 - `notes text null`
+- `pain_discomfort_locations text[] not null default '{}'`
+- `pain_discomfort_severity int not null default 1 check (pain_discomfort_severity between 1 and 5)`
+- `form_breakdown_flag boolean not null default false`
+- `form_breakdown_notes text null`
 - `version int not null default 1`
 - `deleted_at timestamptz null`
 Constraints: unique `(user_id, scheduled_for_date, workout_day_id) where deleted_at is null and status <> 'deleted'`.
@@ -265,8 +270,39 @@ Unique: `(user_id, lower(name)) where deleted_at is null`.
 - `difficulty_score int not null check (difficulty_score between 1 and 5)`
 - `soreness_score int not null check (soreness_score between 1 and 5)`
 - `notes text null`
+- `pain_discomfort_locations text[] not null default '{}'`
+- `pain_discomfort_severity int not null default 1 check (pain_discomfort_severity between 1 and 5)`
+- `form_breakdown_flag boolean not null default false`
+- `form_breakdown_notes text null`
 - `version int not null default 1`
 - `deleted_at timestamptz null`
+
+
+## 2.18 `exercise_catalog`
+- `id uuid pk` (deterministic seed IDs)
+- `slug text not null unique`
+- `name text not null`
+- `movement_intent movement_intent not null`
+- `equipment_key text not null`
+- `primary_muscles text[] not null default '{}'`
+- `secondary_muscles text[] not null default '{}'`
+- `contraindication_tags text[] not null default '{}'`
+- `instruction_cues text[] not null check (array_length(instruction_cues,1) >= 1)`
+- `safety_cues text[] not null check (array_length(safety_cues,1) >= 1)`
+- `is_active boolean not null default true`
+Constraints: unique `(slug)` and seed row count acceptance test `= 50 active canonical rows`.
+
+## 2.19 `user_exercise_preference`
+- `id uuid pk`
+- `user_id uuid not null references auth.users(id)`
+- `exercise_id uuid not null references exercise_catalog(id)`
+- `preference text not null check (preference in ('preferred','disliked','locked_in','locked_out'))`
+- `reason text null`
+- `active boolean not null default true`
+- `version int not null default 1`
+- `deleted_at timestamptz null`
+Constraints: unique `(user_id, exercise_id) where deleted_at is null`.
+Generator scoring impact (deterministic additive weight): `preferred +25`, `disliked -35`, `locked_in force-include when feasible`, `locked_out hard-exclude`.
 
 ## 2.17 `user_limitation`
 - `id uuid pk`
@@ -334,13 +370,14 @@ Response:
 - `PUT /v1/equipment/profiles/{id}/calendar` request `{entries:[{weekday:1,equipmentProfileId:"uuid"}]}` response `{data:{entries,version}}`.
 
 ### 5.3 Plan generation/regeneration
-- `POST /v1/plans/generate`
-- `POST /v1/plans/{id}/regenerate`
+- `POST /v1/plans/generate` request `{mutationId,clientTimestamp,goalPlanId,equipmentProfileId,calendarWeekStart}`
+- `POST /v1/plans/{id}/regenerate` request `{mutationId,clientTimestamp,reason,ifMatchVersion,preserveInProgress:true}`
 Response shape (both):
 ```json
-{"data":{"planVersion":{},"workoutDays":[],"exerciseInstances":[],"setPrescriptions":[],"explanations":[],"warnings":[],"infeasibleErrors":[]}}
+{"data":{"planVersion":{"id":"uuid","versionNumber":3,"isActive":true,"generateMode":"initial|regenerate"},"workoutDays":[{"id":"uuid","dayIndex":1,"dayLabel":"Push A","estimatedDurationMin":60}],"exerciseInstances":[{"id":"uuid","workoutDayId":"uuid","exerciseId":"uuid","slotIndex":1,"movementIntent":"horizontal_push","trimPriority":1,"optional":false}],"setPrescriptions":[{"id":"uuid","exerciseInstanceId":"uuid","setIndex":1,"repMin":6,"repMax":10,"targetRir":2.0}],"explanations":[{"code":"EQUIPMENT_MATCH","message":"Matched dumbbell profile"}],"warnings":[],"infeasibleErrors":[]}}
 ```
 `infeasibleErrors` must be non-empty when HTTP 422.
+
 
 ### 5.4 Workout execution
 - `POST /v1/workout-sessions/start` -> `{data:{workoutSession}}`
@@ -361,8 +398,23 @@ Status transitions:
 - `DELETE /v1/body-weight-logs/{id}` soft delete
 Response includes computed fields: `{weightKg,weeklyAvgKg,weeklyTrendKg}`.
 
+
+## 5.7 Regeneration behavior contract
+- **Same-day not_started session:** if scheduled date is local today and status `not_started`, regenerate may rebind to new active `plan_version` unless a local draft exists (see §5.8).
+- **Same-day in_progress session:** never rebound; remains attached to original plan_version until terminal.
+- **Future not_started sessions:** eligible for rebind to newest active plan_version; preserve `scheduled_for_date`.
+- **Local-draft-protected sessions:** server must return `409 DRAFT_CONFLICT` with authoritative mapping metadata when client indicates unsynced draft mutations for that session.
+- **Past not_started sessions:** remain historical; no automatic rebind.
+
 ### 5.6 Food logs/saved meals/recommendations/limitations
-CRUD endpoints unchanged; all responses include `{data:{...,version}}` and soft-delete responses include `deletedAt`.
+- `POST /v1/limitations` request `{limitationType,affectedBodyRegion,affectedMovementIntents,affectedExerciseIds,severity,painFlag,notes}` response `{data:{limitation,version}}`
+- `PATCH /v1/limitations/{id}` request same mutable fields + `ifMatchVersion` response `{data:{limitation,version}}`
+- `POST /v1/recommendations/{id}/accept|ignore` request `{mutationId,clientTimestamp}` response `{data:{recommendation,status,actedAt,version}}`
+- `POST /v1/food-logs` request `{loggedOn,mealType,savedMealId?,name,calories,proteinG,carbsG,fatG,clientLogId?}` response `{data:{foodLog,version}}`
+- `PATCH /v1/food-logs/{id}` and `DELETE /v1/food-logs/{id}` standard versioned responses
+- `POST /v1/saved-meals` request `{name,ingredients,calories,proteinG,carbsG,fatG}` response `{data:{savedMeal,version}}`
+- `PATCH /v1/saved-meals/{id}` and `DELETE /v1/saved-meals/{id}` standard versioned responses.
+
 
 ---
 
@@ -418,3 +470,24 @@ Beginner rule: same slots, accessory sets -1 (floor 2).
 13. 5-day and 6-day template slot order and trim priorities are deterministic.
 14. Regeneration preserves in-progress session binding and only rebinds eligible not-started future sessions.
 15. Mutation ID hash mismatch returns `409 MUTATION_ID_REUSE_CONFLICT` with stored operation metadata.
+
+## 5.8 Local workout draft sync contract
+Local draft object (per session):
+```json
+{
+  "draftId":"uuid",
+  "workoutSessionId":"uuid",
+  "planVersionId":"uuid",
+  "baseSessionVersion":12,
+  "operations":[
+    {"opId":"uuid","seq":1,"type":"set_log_create|set_log_update|set_log_skip|set_log_delete|substitution|session_complete|session_partial|session_abandon","payload":{},"clientTs":"ISO-8601"}
+  ],
+  "lastSyncedSeq":0
+}
+```
+Rules:
+- Queue ordering is strictly ascending `seq`; server rejects gaps/duplicates with `409 MUTATION_SEQUENCE_CONFLICT`.
+- Retry is exponential backoff (1s,2s,4s,8s, max 5 attempts) with same `mutationId`/`opId` (idempotent).
+- Conflict: if `baseSessionVersion` stale, server returns `409 VERSION_CONFLICT` + latest session projection and accepted `lastAppliedSeq`.
+- Client/server ID reconciliation: response returns `idMap` for local IDs (`clientSetLogId`,`clientItemId`,`draftId`) to canonical UUIDs.
+- Apply is atomic per op; partial success within one op is forbidden.
