@@ -16,7 +16,7 @@ This contract defines MVP-only, implementation-ready behavior for:
 - deterministic generation and recovery rules
 - acceptance tests and readiness checklist
 
-Out of scope for MVP: nutrition entities, nutrition APIs, per-day equipment calendar logic.
+Out of scope for MVP: nutrition entities, nutrition APIs, per-day equipment calendar logic, historical body-weight trend storage (`BodyWeightLog`, see §2.14).
 
 ---
 
@@ -66,9 +66,15 @@ All PKs are UUIDv7. All tables include `created_at timestamptz not null default 
 - `goal_type`
 - `days_per_week` (int, 2..6)
 - `session_length_min` (int, 20..120)
-- `focus_muscles` (text[] not null, non-empty)
+- `focus_muscles` (`text[] not null default '{}'`)  
+  - optional onboarding input; empty array is valid for MVP.
 - unique partial: one active goal plan per user (`is_active=true`)
 - `is_active` (boolean not null default true)
+
+Generator behavior when `focus_muscles=[]`:
+- no focus-muscle boost is applied
+- no focus-muscle protection is applied during accessory cuts
+- balanced default volume targets are used
 
 ### 2.3 `equipment_profile`
 - `id` (pk)
@@ -102,7 +108,7 @@ All PKs are UUIDv7. All tables include `created_at timestamptz not null default 
 - `cues_json` (jsonb)
 - read-only to clients; service-role seed ownership
 
-### 2.6 `user_exercise_preference` (NEW MVP blocker resolved)
+### 2.6 `user_exercise_preference`
 - `id` (pk)
 - `user_id` (fk)
 - `exercise_id` (fk -> exercise_catalog.id)
@@ -110,12 +116,8 @@ All PKs are UUIDv7. All tables include `created_at timestamptz not null default 
 - `source` (text default `user_explicit`)
 - `notes` (text nullable, private, analytics-excluded)
 - uniqueness: `unique(user_id, exercise_id)`
-- generator use:
-  - preferred: positive score boost during slot ranking
-  - disliked: penalty; if no alternatives and constraints fail, substitution candidate set built from same movement intent/equipment compatibility
-  - neutral: no bias
 
-### 2.7 `user_limitation` (NEW MVP blocker resolved)
+### 2.7 `user_limitation`
 - `id` (pk)
 - `user_id` (fk)
 - `limitation_type` (enum)
@@ -126,13 +128,21 @@ All PKs are UUIDv7. All tables include `created_at timestamptz not null default 
 - `started_on` (date nullable)
 - `resolved_on` (date nullable)
 - `notes` (text nullable, private, analytics-excluded)
-- privacy: only owner + service role
-- eligibility effect:
-  - `hard_block`: exercise ineligible if catalog movement intent intersects affected intents OR pain map denies location
-  - `high`: strong penalty and substitution-first
-  - `moderate|low`: score penalty only
 
-### 2.8 `plan_version`
+### 2.8 `notification_preference` (MVP core)
+- `id` (pk)
+- `user_id` (uuid not null unique fk -> auth.users.id)
+- `workout_reminder_enabled` (boolean not null default true)
+- `workout_reminder_minutes_before` (int not null default 60; allowed 5..1440)
+- `missed_workout_followup_enabled` (boolean not null default true)
+- `recommendation_pending_review_enabled` (boolean not null default true)
+- `streak_milestone_enabled` (boolean not null default false)
+- `quiet_hours_start` (time not null default `'21:00:00'`)  
+- `quiet_hours_end` (time not null default `'08:00:00'`)
+- `timezone` (text not null; IANA zone)
+- `created_at`, `updated_at`
+
+### 2.9 `plan_version`
 - `id`, `user_id`, `goal_plan_id`
 - `based_on_plan_version_id` (nullable)
 - `version_number` (int)
@@ -141,21 +151,21 @@ All PKs are UUIDv7. All tables include `created_at timestamptz not null default 
 - `input_snapshot_json`, `output_snapshot_json`, `validation_warnings_json`
 - uniqueness: one active plan per user (`unique(user_id) where status='active'`)
 
-### 2.9 `workout_day`, `exercise_instance`, `set_prescription`
+### 2.10 `workout_day`, `exercise_instance`, `set_prescription`
 - `workout_day`: links to `plan_version`, holds day order/schedule metadata
 - `exercise_instance`: links to `workout_day`, references `exercise_catalog`, stores slot metadata and trim priority
 - `set_prescription` fields:
   - `id`, `user_id`, `exercise_instance_id` fk, `set_order`, `target_reps_min`, `target_reps_max`, `target_rpe` nullable, `set_type` text default `working`
   - uniqueness: `unique(exercise_instance_id, set_order)`
 
-### 2.10 `workout_session`
+### 2.11 `workout_session`
 - `id`, `user_id`, `plan_version_id`, `workout_day_id`
 - `scheduled_for_date` (date)
 - `status` enum
 - `started_at`, `finished_at` nullable
 - `version_token` (int default 1)
 
-### 2.11 `set_log` (fully specified)
+### 2.12 `set_log`
 - `id` (pk)
 - `user_id` (fk)
 - `workout_session_id` (fk)
@@ -163,20 +173,22 @@ All PKs are UUIDv7. All tables include `created_at timestamptz not null default 
 - `set_prescription_id` (fk nullable)
 - `set_source` (`prescribed|added`)
 - `set_state` (`active|skipped|deleted`)
+- `display_order` (numeric(8,3) not null)
 - `reps` (int nullable when skipped)
 - `load` (numeric(6,2) nullable)
 - `rpe` (numeric(3,1) nullable)
 - `client_mutation_id` (text not null)
 - `logged_at` (timestamptz default now())
 
-Rules:
-- `set_prescription_id` nullable **only** when `set_source='added'`; required for prescribed/skipped prescribed sets.
-- Added set linkage: must always include `exercise_instance_id`; may optionally include nearest preceding prescribed set for UI context only (not required in DB).
-- idempotency uniqueness scope: `unique(user_id, workout_session_id, client_mutation_id)`.
-- duplicate replay response: HTTP 200 with original persisted resource and `idempotentReplay=true`.
-- skipped prescribed set behavior: create `set_log` with `set_source='prescribed'`, `set_state='skipped'`, matching `set_prescription_id`, null reps/load allowed.
+Ordering + idempotency rules:
+- prescribed sets: `display_order = set_prescription.set_order`
+- added sets: client must send `displayOrder`; server persists as submitted (within exercise scope)
+- offline sync: server preserves client order within each `exercise_instance_id`
+- final rendering order: by `exercise_instance.order`, then `display_order`, then `logged_at` fallback
+- `set_prescription_id` nullable only when `set_source='added'`
+- uniqueness scope: `unique(user_id, workout_session_id, client_mutation_id)`
 
-### 2.12 `post_workout_check_in`
+### 2.13 `post_workout_check_in`
 - `id`, `user_id`, `workout_session_id` (unique)
 - `soreness_level`
 - `soreness_locations` pain_location[] nullable
@@ -187,7 +199,7 @@ Rules:
 - `fatigue_level` nullable
 - `form_breakdown` boolean nullable
 
-### 2.13 `recommendation`
+### 2.14 `recommendation`
 - `id`, `user_id`, `workout_session_id` nullable, `exercise_instance_id` nullable
 - `type`, `status`
 - `title`, `user_facing_reason`, `educational_context`
@@ -198,111 +210,185 @@ Rules:
 - `other_reason_text` text nullable (private, analytics-excluded)
 - `version_token` int default 1
 
+### 2.15 `BodyWeightLog` scope note
+- `BodyWeightLog` is **post-MVP / v1.1** unless PRD changes.
+- MVP stores only `body_weight` and `body_weight_unit` on `user_profile`.
+
 ---
 
 ## 3) API contracts (implementation-ready)
 
-All endpoints require Bearer auth unless marked Anonymous. Errors use `{ code, message, fieldErrors? }`. Validation errors return 422. Auth failures return 401. Ownership violations return 403. Not found returns 404. Conflict/version issues return 409. 
+### 3.0 Common behavior
+- Auth: Bearer JWT required for all `/v1/*` endpoints.
+- Error schema (all non-2xx):
+```json
+{ "error": { "code": "string", "message": "string", "fieldErrors": [{"field":"string","message":"string"}] } }
+```
+- Status codes: `401` auth missing/invalid, `403` ownership denied, `404` not found, `409` version conflict/idempotency conflict, `422` validation.
+- Idempotent replay success includes:
+```json
+{ "meta": { "idempotentReplay": true } }
+```
+- Version-token conflict includes:
+```json
+{ "error": { "code":"VERSION_CONFLICT", "message":"Stale versionToken", "currentVersionToken": 7 } }
+```
 
-### 3.1 Equipment profile + items
-- `POST /v1/equipment-profiles`
-  - body: `{ name: string, isActive?: boolean }`
-  - response 201: `{ profile: { id,userId,name,isActive,createdAt,updatedAt } }`
-  - side effect: if `isActive=true`, other profiles set inactive transactionally.
+### 3.1 Auth scope
+MVP auth is Supabase Auth, **email/password only**. Apple/Google sign-in is fast-follow post-MVP and can only be enabled after explicit post-G3 approval.
+
+### 3.2 Equipment profiles
+- `POST /v1/equipment-profiles` (idempotency key required: `Idempotency-Key`)
+  - body: `{ "name": "Home", "isActive": true }`
+  - 201:
+```json
+{ "data": { "id":"uuid","userId":"uuid","name":"Home","isActive":true,"createdAt":"iso","updatedAt":"iso" } }
+```
 - `PATCH /v1/equipment-profiles/{id}`
-  - body: `{ name?: string, isActive?: boolean, versionToken: number }`
-  - idempotency: same payload/version replay returns 200 unchanged.
+  - body: `{ "name?":"Gym", "isActive?":false, "versionToken": 3 }`
 - `DELETE /v1/equipment-profiles/{id}`
-  - soft delete; reject if only active profile without replacement.
+  - body: `{ "versionToken": 3 }`
 - `POST /v1/equipment-profiles/{id}/items`
-  - body: `{ equipmentKey: string }`
-  - response 201 `{ item }`, 409 on duplicate equipment key in same profile.
-- `DELETE /v1/equipment-profiles/{id}/items/{itemId}` soft delete.
+  - body: `{ "equipmentKey": "barbell" }`
+  - 201:
+```json
+{ "data": { "id":"uuid","equipmentProfileId":"uuid","equipmentKey":"barbell","createdAt":"iso","updatedAt":"iso" } }
+```
+- `DELETE /v1/equipment-profiles/{id}/items/{itemId}`
 
-### 3.2 User exercise preferences
+Ownership: owner only across all endpoints.
+
+### 3.3 User exercise preferences
 - `PUT /v1/users/me/exercise-preferences/{exerciseId}`
-  - body: `{ preferenceType: 'preferred'|'disliked'|'neutral', notes?: string, clientMutationId: string }`
-  - idempotency: unique `(user, endpoint target, clientMutationId)`; replay returns prior 200 with `idempotentReplay=true`.
+  - body: `{ "preferenceType":"preferred", "notes?":"string", "clientMutationId":"string" }`
+  - success 200:
+```json
+{ "data": { "id":"uuid","exerciseId":"uuid","preferenceType":"preferred","notes":null,"updatedAt":"iso" }, "meta": { "idempotentReplay": false } }
+```
 - `GET /v1/users/me/exercise-preferences`
-  - response `{ items:[...] }`
-- side effects: generator ranking cache invalidation for current user.
+  - 200:
+```json
+{ "data": [{ "id":"uuid","exerciseId":"uuid","preferenceType":"preferred","notes":null,"updatedAt":"iso" }] }
+```
 
-### 3.3 User limitations
+### 3.4 User limitations
 - `POST /v1/users/me/limitations`
-  - body: `{ limitationType, painLocations?:[], affectedMovementIntents?:[], severity, notes?:string, startedOn?:date }`
+  - body: `{ "limitationType":"pain_history","painLocations":["knee"],"affectedMovementIntents":["squat"],"severity":"moderate","notes?":"string","startedOn?":"YYYY-MM-DD" }`
 - `PATCH /v1/users/me/limitations/{id}`
-  - body includes mutable fields + `versionToken`
+  - body: `{ "severity?":"high", "status?":"active", "notes?":"string", "versionToken":2 }`
 - `POST /v1/users/me/limitations/{id}/resolve`
-  - body `{ resolvedOn?:date, versionToken:number }`
-- side effects: exercise eligibility cache invalidation.
+  - body: `{ "resolvedOn?":"YYYY-MM-DD", "versionToken":2 }`
 
-### 3.4 Plans: generate / accept / regenerate / revert
-- `POST /v1/plans/generate`
-  - body: `{ goalPlanId, equipmentProfileId, clientRequestId }`
-  - idempotency by `clientRequestId` 24h TTL; replay returns same draft plan.
+### 3.5 Notification preferences
+- `GET /v1/users/me/notification-preferences`
+  - 200:
+```json
+{ "data": { "id":"uuid","userId":"uuid","workoutReminderEnabled":true,"workoutReminderMinutesBefore":60,"missedWorkoutFollowupEnabled":true,"recommendationPendingReviewEnabled":true,"streakMilestoneEnabled":false,"quietHoursStart":"21:00:00","quietHoursEnd":"08:00:00","timezone":"America/New_York","createdAt":"iso","updatedAt":"iso" } }
+```
+- `PATCH /v1/users/me/notification-preferences`
+  - body (partial allowed):
+```json
+{ "workoutReminderEnabled?":true,"workoutReminderMinutesBefore?":45,"missedWorkoutFollowupEnabled?":true,"recommendationPendingReviewEnabled?":false,"streakMilestoneEnabled?":false,"quietHoursStart?":"21:00:00","quietHoursEnd?":"08:00:00","timezone?":"America/New_York","versionToken":4 }
+```
+  - 200 returns same shape as GET.
+
+### 3.6 Plans: generate / accept / regenerate / revert
+- `POST /v1/plans/generate` (Idempotency-Key required)
+  - body: `{ "goalPlanId":"uuid", "equipmentProfileId":"uuid", "clientRequestId":"string" }`
 - `POST /v1/plans/{planVersionId}/accept`
-  - body: `{ expectedCurrentActivePlanVersionId?:uuid, versionToken:number }`
-  - transactional side effect: promote draft->active, archive prior active.
-- `POST /v1/plans/{planVersionId}/regenerate`
-  - body: `{ reason:'manual'|'missed_workout_recovery', protectInProgress:true, clientRequestId }`
-  - response new draft.
-- `POST /v1/plans/{planVersionId}/revert`
-  - body: `{ versionToken:number, clientRequestId }`
-  - side effect: new active `revert_clone`, prior active archived.
+  - body: `{ "expectedCurrentActivePlanVersionId?":"uuid", "versionToken":2 }`
+- `POST /v1/plans/{planVersionId}/regenerate` (Idempotency-Key required)
+  - body: `{ "reason":"manual|missed_workout_recovery", "protectInProgress":true, "clientRequestId":"string" }`
+- `POST /v1/plans/{planVersionId}/revert` (Idempotency-Key required)
+  - body: `{ "versionToken":4, "clientRequestId":"string" }`
 
-### 3.5 Workout session lifecycle
-- `POST /v1/workout-sessions/start` body `{ workoutDayId, scheduledForDate, clientRequestId }`
-- `POST /v1/workout-sessions/{id}/resume` body `{ versionToken }`
-- `POST /v1/workout-sessions/{id}/finish` body `{ versionToken, finishedAt? }`
-- `POST /v1/workout-sessions/{id}/partial` body `{ versionToken, reason?:string }`
-- `POST /v1/workout-sessions/{id}/skip` body `{ versionToken, reason?:string }`
-- `POST /v1/workout-sessions/{id}/completed-outside-app` body `{ versionToken, notes?:string }`
-- concurrency: optimistic lock on `versionToken`; server increments on status change.
+### 3.7 Workout session lifecycle
+- `POST /v1/workout-sessions/start` body `{ "workoutDayId":"uuid", "scheduledForDate":"YYYY-MM-DD", "clientRequestId":"string" }`
+- `POST /v1/workout-sessions/{id}/resume` body `{ "versionToken":2 }`
+- `POST /v1/workout-sessions/{id}/finish` body `{ "versionToken":2, "finishedAt?":"iso" }`
+- `POST /v1/workout-sessions/{id}/partial` body `{ "versionToken":2, "reason?":"string" }`
+- `POST /v1/workout-sessions/{id}/skip` body `{ "versionToken":2, "reason?":"string" }`
+- `POST /v1/workout-sessions/{id}/completed-outside-app` body `{ "versionToken":2, "notes?":"string" }`
 
-### 3.6 Set logging / added sets / skipped sets
+### 3.8 Set logging / added sets / skipped sets
 - `POST /v1/workout-sessions/{id}/set-logs`
+  - prescribed:
+```json
+{ "exerciseInstanceId":"uuid", "setPrescriptionId":"uuid", "displayOrder":2, "reps":8, "load?":100, "rpe?":8.5, "clientMutationId":"string" }
+```
+  - added:
+```json
+{ "exerciseInstanceId":"uuid", "setSource":"added", "displayOrder":2.5, "reps":12, "load?":25, "rpe?":9, "clientMutationId":"string" }
+```
+  - skipped:
+```json
+{ "exerciseInstanceId":"uuid", "setPrescriptionId":"uuid", "setState":"skipped", "displayOrder":3, "clientMutationId":"string" }
+```
+  - 200/201:
+```json
+{ "data": { "id":"uuid","workoutSessionId":"uuid","exerciseInstanceId":"uuid","setPrescriptionId":null,"setSource":"added","setState":"active","displayOrder":2.5,"reps":12,"load":25,"rpe":9,"loggedAt":"iso" }, "meta": { "idempotentReplay": false } }
+```
+
+### 3.9 Exercise substitutions
+- `GET /v1/workout-sessions/{id}/substitution-candidates?exerciseInstanceId={exerciseInstanceId}`
+  - 200:
+```json
+{ "data": { "workoutSessionId":"uuid","exerciseInstanceId":"uuid","generatedAt":"iso","candidates":[{ "exerciseId":"uuid","name":"Incline Dumbbell Press","movementIntentMatch":true,"primaryMuscleMatch":true,"equipmentFeasible":true,"difficultyMatch":"similar","fatigueCostMatch":"similar","score":87,"scoreBreakdown":{"movementIntent":30,"primaryMuscle":25,"equipment":15,"difficulty":8,"fatigueCost":6,"preference":3,"limitation":0},"userFacingReason":"Keeps horizontal press intent while fitting your available dumbbells.","educationalContext":"You will still train chest/triceps with slightly more stabilization demand.","suggestedLoadHandling":{"type":"history_based","lastSuccessfulLoad":32.5,"lastSuccessfulReps":10,"guidance":"Start at your last successful load that hit minimum reps."} }] } }
+```
+- Candidate algorithm constraints:
+  - preserve movement intent
+  - preserve primary muscle
+  - prefer similar difficulty and fatigue cost
+  - enforce equipment feasibility
+  - enforce pain/limitation mapping
+  - apply preference constants in §4
+  - return explainable reason fields (`userFacingReason`, `educationalContext`)
+
+- `POST /v1/workout-sessions/{id}/substitutions`
   - body:
-    - prescribed log: `{ exerciseInstanceId, setPrescriptionId, reps, load?, rpe?, clientMutationId }`
-    - added set: `{ exerciseInstanceId, setSource:'added', reps, load?, rpe?, clientMutationId }`
-    - skipped prescribed: `{ exerciseInstanceId, setPrescriptionId, setState:'skipped', clientMutationId }`
+```json
+{ "exerciseInstanceId":"uuid", "replacementExerciseId":"uuid", "replacementSource":"candidate_list|manual_override", "candidateListVersion":"string", "manualOverrideReason?":"string", "reason":"preference|limitation|pain|equipment", "versionToken":3, "clientRequestId":"string" }
+```
   - validation:
-    - `setPrescriptionId` required unless added set.
-    - exercise/session ownership chain must match.
-  - duplicate replay: 200 + original row + `idempotentReplay=true`.
+    - `replacementSource='candidate_list'` requires replacement exists in latest server candidate list for that exercise instance.
+    - `replacementSource='manual_override'` requires `manualOverrideReason`.
 
-### 3.7 Post-workout check-ins
+Load-handling rules in response payload:
+- if substitute has user history hitting minimum reps: suggest last successful load
+- if no history: `suggestedLoadHandling.type='no_history_blank_load'` + conservative start guidance
+- bodyweight substitutions: guidance uses variation/assistance level (no numeric load)
+- machine substitutions with non-comparable stacks: blank load guidance
+
+### 3.10 Post-workout check-ins
 - `PUT /v1/workout-sessions/{id}/check-in`
-  - body `{ sorenessLevel, sorenessLocations?, painFlag, painLocations?, painType?, painNotes?, fatigueLevel?, formBreakdown?, versionToken }`
-  - validation: pain fields required iff `painFlag=true`.
-  - side effects: recommendation generation job enqueue.
+  - body `{ "sorenessLevel":"mild","sorenessLocations?":[],"painFlag":false,"painLocations?":[],"painType?":null,"painNotes?":"","fatigueLevel?":"normal","formBreakdown?":false,"versionToken":2 }`
 
-### 3.8 Missed-workout recovery actions
+### 3.11 Missed-workout recovery actions
 - `POST /v1/workout-sessions/{id}/recovery/move-next`
 - `POST /v1/workout-sessions/{id}/recovery/skip-continue`
 - `POST /v1/workout-sessions/{id}/recovery/completed-outside-app`
 - `POST /v1/workout-sessions/{id}/recovery/regenerate-week`
-- body `{ versionToken, clientRequestId }` each; all idempotent by clientRequestId.
+- body for all: `{ "versionToken":3, "clientRequestId":"string" }`
 
-### 3.9 Exercise substitutions
-- `POST /v1/workout-sessions/{id}/substitutions`
-  - body `{ exerciseInstanceId, replacementExerciseId, reason:'preference'|'limitation'|'pain'|'equipment', versionToken, clientRequestId }`
-  - side effects: replacement must preserve movement intent slot + equipment feasibility.
+### 3.12 Recommendations
+- `POST /v1/recommendations/{id}/accept` body `{ "versionToken":2 }`
+- `POST /v1/recommendations/{id}/ignore` body `{ "versionToken":2, "ignoredReason?":"too_aggressive", "otherReasonText?":"string" }`
+- `POST /v1/recommendations/{id}/dismiss` body `{ "versionToken":2, "ignoredReason?":"wrong_exercise", "otherReasonText?":"string" }`
 
-### 3.10 Recommendation actions
-- `POST /v1/recommendations/{id}/accept` body `{ versionToken }`
-- `POST /v1/recommendations/{id}/ignore` body `{ versionToken, ignoredReason?, otherReasonText? }`
-- `POST /v1/recommendations/{id}/dismiss` body `{ versionToken, ignoredReason?, otherReasonText? }`
-- concurrency: optimistic lock on recommendation `version_token`.
-
-### 3.11 Local draft sync recovery
-- `POST /v1/sync/local-drafts/recover`
-  - body `{ localDraftId, workoutSessionId?, setLogs:[...], skippedSets:[...], clientSyncBatchId }`
-  - idempotency by `(user, clientSyncBatchId)`.
-  - response includes accepted logs, duplicates, conflicts.
+### 3.13 Local draft sync recovery
+- `POST /v1/sync/local-drafts/recover` (Idempotency-Key required)
+  - body:
+```json
+{ "localDraftId":"string", "workoutSessionId?":"uuid", "setLogs":[{ "exerciseInstanceId":"uuid", "setPrescriptionId?":"uuid", "setSource":"prescribed|added", "setState":"active|skipped", "displayOrder":1, "reps?":8, "load?":100, "rpe?":8, "clientMutationId":"string", "loggedAtClient":"iso" }], "clientSyncBatchId":"string" }
+```
+  - response:
+```json
+{ "data": { "accepted":["clientMutationId1"], "duplicates":["clientMutationId2"], "conflicts":[] } }
+```
 
 ---
 
-## 4) Generator behavior integration for preferences and limitations
+## 4) Generator behavior integration
 
 Scoring per candidate exercise for a slot:
 - base score from PRD template fit
@@ -312,98 +398,102 @@ Scoring per candidate exercise for a slot:
 - ineligible if limitation severity `hard_block` or pain-map disallow
 - substitution fallback chooses same movement intent, same day equipment, nearest fatigue cost
 
-Machine constants (MVP):
-- `PREFERRED_BOOST = +12`
-- `DISLIKED_PENALTY = -18`
+Machine constants (MVP, PRD-aligned):
+- `PREFERRED_BOOST = +10`
+- `DISLIKED_PENALTY = -30`
 - `LIMITATION_LOW_PENALTY = -8`
 - `LIMITATION_MODERATE_PENALTY = -16`
 - `LIMITATION_HIGH_PENALTY = -30`
 
----
-
-## 5) Supabase RLS matrix (table-by-table)
-
-Legend: Owner = `auth.uid() = user_id`.
-
-- `user_profile`: select owner; insert owner only; update owner; delete soft-delete owner; service-role may hard-delete for legal deletion.
-- `goal_plan`: select/insert/update/delete owner; service-role may activate/archive transactionally.
-- `equipment_profile`: select/insert/update/delete owner; unique-active enforced DB-side.
-- `equipment_profile_item`: select/insert/update/delete owner; insert/update require parent profile owner match.
-- `exercise_catalog`: select all authenticated; insert/update/delete service-role only.
-- `user_exercise_preference`: select/insert/update/delete owner only; fk exercise must exist.
-- `user_limitation`: select/insert/update/delete owner only; notes private; service-role read for generation only.
-- `plan_version`: select owner; insert/update service-role only; delete forbidden to clients (archive instead).
-- `workout_day`: select owner; insert/update/delete service-role only.
-- `exercise_instance`: select owner; insert/update/delete service-role only.
-- `set_prescription`: select owner; insert/update/delete service-role only.
-- `workout_session`: select owner; insert service-role and owner-start endpoint; update owner constrained by state machine; delete soft-delete owner when `not_started` only.
-- `set_log`: select owner; insert owner/service-role; update/delete forbidden except service-role maintenance for GDPR redaction envelope.
-- `post_workout_check_in`: select/insert/update owner; delete soft-delete owner.
-- `recommendation`: select owner; update owner for status transitions only; insert service-role; delete owner dismiss->soft-delete.
-
-Mandatory FK ownership-chain validations (DB constraints/triggers):
-- any child row with `user_id` must equal ancestor chain owner.
-- cross-user FK attempts must fail with `foreign_key_ownership_violation`.
-
-Cross-user FK rejection tests required for every child table in acceptance suite.
+Future calibration proposals may adjust constants post-MVP only after PRD update + experiment sign-off.
 
 ---
 
-## 6) Closed blocker resolutions
+## 5) Supabase RLS matrix
 
-1. **Exercise catalog count + seed ownership:** lock at **84 exercises** for MVP; seed artifact owned by Content + Head Coach; DB seed writes service-role only.
-2. **Movement intent representation:** canonical storage = `movement_intents text[]` with mandatory primary intent first; PRD slot map artifact versioned as `movement_intent_map_v1.json`.
-3. **PRD §7.3.2 pain mapping machine artifact:** required file `pain_location_to_muscle_intent_v1.json` with semantic version + reviewer sign-off.
-4. **Accessory-cut ordered rules artifact:** required file `accessory_cut_priority_v1.json` consumed by generator.
-5. **Top-rep condition constants:** top set qualifies when `actual_reps >= target_reps_max - 1`; if rep range width > 3, threshold=`target_reps_max`; ties broken by last two sessions median.
-6. **Deload signals constants:** signals = performance drop, soreness high, pain flag, fatigue high, form breakdown; trigger when >=3 signals in rolling 7 days.
-7. **Anonymous sample-plan endpoint controls:** 10 req/day/device fingerprint, burst 3/min/IP, hCaptcha after anomaly score threshold, telemetry excludes free text + no durable identity join.
+Owner = `auth.uid() = user_id`.
+
+- `user_profile`, `goal_plan`, `equipment_profile`, `equipment_profile_item`, `user_exercise_preference`, `user_limitation`, `workout_session`, `post_workout_check_in`, `recommendation`: owner CRUD within state-machine constraints.
+- `exercise_catalog`, `plan_version`, `workout_day`, `exercise_instance`, `set_prescription`: service-role write, owner read where applicable.
+- `set_log`: owner select + insert, no owner update/delete.
+- `notification_preference`:
+  - owner: select/insert/update/delete own row
+  - service-role: read-only and only for notification dispatch jobs
+
+Mandatory FK ownership-chain validations:
+- child `user_id` must equal ancestor `user_id`
+- cross-user FK writes fail with `foreign_key_ownership_violation`
 
 ---
 
-## 7) PRD §18 decisions included in readiness checklist
+## 6) Regeneration, local drafts, and non-destructive guarantees
 
-- Legal/privacy deletion text approved and implemented as user-facing policy string.
-- Safety disclaimer copy approved by legal + coach reviewer.
-- Apple/Google sign-in decision finalized (both enabled in MVP).
-- Pricing validation complete against store metadata and backend entitlements.
-- WCAG audit owner assigned (Design Ops) with monthly cadence.
-- Content author/reviewer identified for exercise cues, safety notes, and education cards.
+Hard rule (MVP): if a **client-only unsynced local draft** exists for a workout/session impacted by plan regeneration, equipment revalidation, or missed-workout recovery regeneration, the client must block destructive action and require explicit user choice:
+1. recover/sync draft
+2. finish as partial
+3. discard draft
+
+Additional guarantees:
+- do not silently replace affected workouts while unsynced draft exists
+- server-side `in_progress` sessions remain attached to original `planVersionId`
+- recovered/synced draft becomes normal `WorkoutSession` + `SetLog` records
+- discard requires explicit user action
+- discard never deletes already-synced `set_log` rows
+
+---
+
+## 7) Closed blocker resolutions and MVP decisions
+
+1. Exercise catalog lock: 84 exercises for MVP.
+2. Movement intent representation: `movement_intents text[]`, primary first.
+3. Pain map artifact required: `pain_location_to_muscle_intent_v1.json`.
+4. Accessory-cut artifact required: `accessory_cut_priority_v1.json`.
+5. Top-rep constants and tie-breaks retained from PRD alignment.
+6. Deload trigger retained from PRD alignment.
+7. Anonymous sample-plan endpoint controls retained.
+8. Auth decision: Supabase email/password only for MVP; Apple/Google fast-follow post-MVP after G3 approval.
 
 ---
 
 ## 8) Acceptance tests (expanded)
 
 Required tests:
-1. User exercise preference CRUD + uniqueness (`user_id, exercise_id`) + RLS.
-2. Limitation persistence CRUD, privacy, and analytics exclusion for notes.
-3. Generator preference/limitation scoring effects and substitution eligibility.
-4. SetLog uniqueness scope `(user_id, workout_session_id, client_mutation_id)`.
-5. SetLog duplicate replay returns existing row + `idempotentReplay=true`.
-6. Added set requires exerciseInstance linkage; prescribed set requires setPrescriptionId.
-7. Skipped prescribed set writes `set_state='skipped'` with nullable reps/load.
-8. Endpoint schema validation for all APIs in §3 (request + response JSON schema).
-9. Concurrency token conflict coverage (`versionToken` 409 paths).
-10. Idempotency key behavior coverage (`clientRequestId`, `clientMutationId`, `clientSyncBatchId`).
-11. Table-by-table RLS policy enforcement tests from §5.
-12. Cross-user FK rejection tests for all ownership-chain tables.
-13. Analytics PII exclusion tests (pain notes, limitation notes, ignored otherReasonText excluded).
-14. Account deletion + retention behavior (soft-delete timings, legal hold exceptions, hard-delete path).
-15. Anonymous sample-plan rate-limit and abuse-control behavior tests.
+1. User exercise preference CRUD + uniqueness + RLS.
+2. Limitation CRUD/privacy + analytics exclusion.
+3. Notification preference defaults and PATCH behavior (quiet hours 21:00-08:00; streak milestones default false).
+4. Generator preference/limitation scoring using constants in §4.
+5. Substitution candidate endpoint ranking/explanations and algorithm constraints.
+6. Substitution accept rejects non-candidate replacements unless manual override provided.
+7. Substitution load-handling modes (history-based, blank load, bodyweight guidance, non-comparable machine guidance).
+8. SetLog uniqueness `(user_id, workout_session_id, client_mutation_id)`.
+9. Added set ordering preserved by `display_order`.
+10. Offline replay preserves intra-exercise set order.
+11. Duplicate idempotent replays do not create duplicate set rows.
+12. Skipped prescribed sets retain correct display order.
+13. Endpoint schema validation for all APIs in §3.
+14. Version token 409 conflict coverage.
+15. Idempotency-key behavior for required endpoints.
+16. RLS policy enforcement for all tables, including `notification_preference` service-role read-only behavior.
+17. Cross-user FK rejection tests for all ownership-chain tables.
+18. Unsynced local draft protection on regenerate/equipment revalidation/recovery workflows.
+19. Discard local draft does not delete already-synced set logs.
+20. BodyWeightLog excluded from MVP implementation scope tests (no MVP dependency on trend history table).
 
 ---
 
 ## 9) Implementation readiness checklist
 
 - [ ] PRD §0 pre-build gates passed.
-- [ ] All machine artifacts present/versioned: movement-intent map, pain map, accessory-cut rules.
-- [ ] Exercise seed set fixed at 84 with approved ownership sign-off.
-- [ ] Data model tables and constraints implemented exactly per §2.
-- [ ] API schemas and error contracts implemented exactly per §3.
-- [ ] SetLog/setPrescription linkage and idempotency behavior implemented per §2.11.
+- [ ] Machine artifacts present/versioned: movement-intent map, pain map, accessory-cut rules.
+- [ ] Exercise seed set fixed at 84 with ownership sign-off.
+- [ ] Data model and constraints implemented exactly per §2.
+- [ ] API schemas/error contracts/idempotency/version semantics implemented per §3.
+- [ ] SetLog ordering + idempotency behavior implemented per §2.12 and §3.8.
+- [ ] Substitution candidate flow + explainability implemented per §3.9.
+- [ ] Local draft non-destructive workflow implemented per §6.
 - [ ] Supabase RLS policies implemented per §5 and validated by automated tests.
-- [ ] Analytics pipeline excludes all private free-text fields.
-- [ ] Account deletion/retention policy implemented and verified.
-- [ ] Legal safety disclaimer, social sign-in decision, pricing validation, WCAG owner/cadence, and content ownership recorded.
+- [ ] Analytics pipeline excludes private free-text fields.
+- [ ] Auth scope remains email/password only in MVP.
+- [ ] BodyWeightLog excluded from MVP unless PRD changes.
 
 **Implementation readiness:** READY TO BUILD once every checklist item above is checked and approved.
