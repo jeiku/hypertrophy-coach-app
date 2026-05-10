@@ -189,6 +189,7 @@ Constraints: unique `(exercise_instance_id, set_index) where deleted_at is null`
 - `form_breakdown_flag boolean not null default false`
 - `form_breakdown_notes text null`
 - `version int not null default 1`
+- `last_applied_client_sequence int not null default 0`
 - `deleted_at timestamptz null`
 Constraints: unique `(user_id, scheduled_for_date, workout_day_id) where deleted_at is null and status <> 'deleted'`.
 
@@ -399,9 +400,13 @@ Assume helper function `auth.uid()` and service role bypass.
 Client-owned read/write (`USING (user_id = auth.uid())`, `WITH CHECK (user_id = auth.uid())`):
 - `user_profile`, `goal_plan`, `equipment_profile`, `equipment_profile_item`, `equipment_calendar_entry`, `training_schedule_entry`, `body_weight_log`, `food_log`, `saved_meal`, `user_limitation`, `post_workout_check_in`, `notification_preference`, `user_exercise_preference`.
 - `training_schedule_entry` additionally enforces ownership trigger `training_schedule_entry.user_id = goal_plan.user_id`.
+- `equipment_calendar_entry` additionally enforces ownership trigger `equipment_calendar_entry.user_id = equipment_profile.user_id`.
+- `post_workout_check_in` additionally enforces ownership trigger `post_workout_check_in.user_id = workout_session.user_id`.
+- `food_log` additionally enforces ownership trigger `food_log.saved_meal_id is null OR food_log.user_id = saved_meal.user_id`.
 
 Read-own / service-write tables:
 - `plan_version`, `workout_day`, `exercise_instance`, `set_prescription`, `workout_session`, `set_log`, `workout_session_exercise`, `recommendation`.
+- `recommendation` write path enforces ownership trigger `recommendation.workout_session_id is null OR recommendation.user_id = workout_session.user_id`.
 - Client role has SELECT-only own rows; direct INSERT/UPDATE/DELETE denied. Backend/service endpoints perform writes.
 
 Ownership-chain read policies:
@@ -415,7 +420,12 @@ Catalog and ledger special policies:
 - `exercise_catalog`: authenticated clients can `SELECT` only rows where `is_active=true`; no client INSERT/UPDATE/DELETE; service/backend manages seed/catalog writes.
 - `processed_mutation`, `workout_session_mutation`: no direct client read/write; service role only.
 
-Cross-user denial acceptance criteria: any user B select/update/insert/link attempt against user A data returns zero rows / forbidden.
+Ownership-chain enforcement for all client-writable tables with user-owned foreign keys:
+- Canonical trigger/check function pattern: `fn_validate_<table>_ownership_chain()` on INSERT/UPDATE (including FK field changes), raising SQLSTATE `23514` mapped to `409 FOREIGN_LINK_CONFLICT`.
+- Minimum enforced rules: `equipment_calendar_entry.user_id = equipment_profile.user_id`; `post_workout_check_in.user_id = workout_session.user_id`; `food_log.saved_meal_id is null OR food_log.user_id = saved_meal.user_id`; `recommendation.workout_session_id is null OR recommendation.user_id = workout_session.user_id`.
+- Full-schema audit requirement: any current/future client-writable table that contains both `user_id` and FK(s) to user-owned table(s) must have same-user ownership-chain trigger coverage before release.
+
+Cross-user denial acceptance criteria: any user B select/update/insert/link attempt against user A data returns zero rows / forbidden, including attempts where user B supplies their own valid `user_id` but links to user A-owned FK rows.
 
 ---
 
@@ -531,8 +541,8 @@ Common rules for all endpoints below:
   - same `(user_id, workout_session_id, mutationId)` + different hash => `409 MUTATION_ID_REUSE_CONFLICT`.
 - Required request fields for all workout mutation endpoints in §5.4: `mutationId`, `clientTimestamp`, `clientSequence`, `ifMatchVersion` (except `start`, where `ifMatchVersion` is optional if no existing session row is being transitioned).
 - For local draft operations, `mutationId` **must equal** local op `opId`, and `clientSequence` **must equal** local op `seq`.
-- Canonical sequence source is `workout_session.last_applied_client_sequence`.
-- Transaction order for every workout mutation endpoint: (1) compute `mutationHash` from normalized body excluding `clientTimestamp`; (2) check existing `(user_id, workout_session_id, mutation_id)` in `workout_session_mutation`; (3) same hash => replay stored response before sequence checks; (4) same mutation id + different hash => `409 MUTATION_ID_REUSE_CONFLICT`; (5) lock target `workout_session` row `FOR UPDATE`; (6) validate `ifMatchVersion`; (7) validate terminal state; (8) validate `clientSequence = workout_session.last_applied_client_sequence + 1`; (9) apply mutation; (10) increment `workout_session.version`; (11) set `workout_session.last_applied_client_sequence = clientSequence`; (12) insert `workout_session_mutation`; (13) commit.
+- Canonical sequence source for **all** workout mutation endpoints in §5.4 is `workout_session.last_applied_client_sequence` (no alternate counter, cache, or per-endpoint sequence source allowed).
+- Transaction order for every workout mutation endpoint remains canonical and mandatory: (1) compute `mutationHash` from normalized body excluding `clientTimestamp`; (2) check existing `(user_id, workout_session_id, mutation_id)` in `workout_session_mutation`; (3) same hash => replay stored response before sequence checks; (4) same mutation id + different hash => `409 MUTATION_ID_REUSE_CONFLICT`; (5) lock target `workout_session` row `FOR UPDATE`; (6) validate `ifMatchVersion`; (7) validate terminal state; (8) validate `clientSequence = workout_session.last_applied_client_sequence + 1`; (9) apply mutation; (10) increment `workout_session.version`; (11) set `workout_session.last_applied_client_sequence = clientSequence`; (12) insert `workout_session_mutation`; (13) commit.
 - Sequence conflicts: duplicate or missing-gap sequence returns `409 MUTATION_SEQUENCE_CONFLICT`.
 - Stale `ifMatchVersion` returns `409 VERSION_CONFLICT` with latest session projection and `lastAppliedSeq`.
 - Replay never increments version or sequence.
@@ -842,6 +852,17 @@ Auditability requirements:
 20. Seed completeness gate: every seeded exercise has non-null movement intent, equipment key, primary muscles, instruction cues, and safety cues.
 21. Template coverage gate: movement intents required by 2-day through 6-day templates each have at least one active eligible canonical exercise.
 22. Generator infeasibility gate: if any required movement intent has zero eligible exercises after filtering, generation fails with HTTP `422` and explicit `infeasibleErrors` reason code `NO_ELIGIBLE_EXERCISE_FOR_MOVEMENT_INTENT`.
+36. Newly materialized `workout_session` row starts with `last_applied_client_sequence = 0` (including sessions created by generator/materialization jobs).
+37. First workout mutation with `clientSequence = 1` succeeds and persists `workout_session.last_applied_client_sequence = 1`.
+38. Replay of same `mutationId` + same hash returns stored response with `meta.replayed=true` and does not increment `workout_session.version` or `last_applied_client_sequence`.
+39. Mutation with `clientSequence = 3` before accepted sequence `2` returns `409 MUTATION_SEQUENCE_CONFLICT`.
+40. Same `mutationId` with different request body/hash returns `409 MUTATION_ID_REUSE_CONFLICT`.
+41. Existing/backfilled `workout_session` rows default `last_applied_client_sequence = 0` before first accepted mutation.
+42. User B cannot create `equipment_calendar_entry` linked to user A `equipment_profile`; request fails `409 FOREIGN_LINK_CONFLICT`.
+43. User B cannot create `post_workout_check_in` linked to user A `workout_session`; request fails `409 FOREIGN_LINK_CONFLICT`.
+44. User B cannot create `food_log` linked to user A `saved_meal`; request fails `409 FOREIGN_LINK_CONFLICT`.
+45. User B cannot create/update any row that links their `user_id` to another user-owned entity via FK; request fails `409 FOREIGN_LINK_CONFLICT`.
+46. Cross-user FK-link rejection remains enforced even when attacker supplies their own valid `user_id` in payload.
 ## 5.8 Local workout draft sync contract
 Local draft object (per session):
 ```json
