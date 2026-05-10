@@ -102,6 +102,22 @@ Indexes: `(equipment_profile_id)`, `(user_id, updated_at desc)`.
 - `deleted_at timestamptz null`
 Constraints: unique `(user_id, weekday) where deleted_at is null`.
 
+## 2.5b `training_schedule_entry`
+- `id uuid pk`
+- `user_id uuid not null references auth.users(id)`
+- `goal_plan_id uuid not null references goal_plan(id)`
+- `weekday int not null check (weekday between 1 and 7)`
+- `day_order int not null check (day_order >= 1)`
+- `preferred boolean not null default true`
+- `version int not null default 1`
+- `deleted_at timestamptz null`
+Constraints:
+- unique `(goal_plan_id, weekday) where deleted_at is null`
+- unique `(goal_plan_id, day_order) where deleted_at is null`
+- active row count per `goal_plan_id` must equal `goal_plan.days_per_week` (validated in service transaction and enforced by deferred constraint trigger on insert/update/delete)
+- ownership chain validation trigger: `training_schedule_entry.user_id = goal_plan.user_id`.
+Indexes: `(user_id, goal_plan_id)`, `(goal_plan_id, day_order)`.
+
 ## 2.6 `plan_version`
 - `id uuid pk`
 - `user_id uuid not null references auth.users(id)`
@@ -133,7 +149,7 @@ Constraints: unique `(plan_version_id, day_index) where deleted_at is null`.
 - `workout_day_id uuid not null references workout_day(id)`
 - `plan_version_id uuid not null references plan_version(id)`
 - `user_id uuid not null references auth.users(id)`
-- `exercise_id uuid not null`
+- `exercise_id uuid not null references exercise_catalog(id)`
 - `slot_index int not null`
 - `movement_intent movement_intent not null`
 - `trim_priority int not null check (trim_priority between 1 and 5)`
@@ -307,6 +323,13 @@ Constraints: one active preference per user (`user_id` unique where `deleted_at 
 - `contraindication_tags text[] not null default '{}'`
 - `instruction_cues text[] not null check (array_length(instruction_cues,1) >= 1)`
 - `safety_cues text[] not null check (array_length(safety_cues,1) >= 1)`
+- `experience_min experience_level not null default 'beginner'`
+- `beginner_friendly boolean not null default true`
+- `setup_complexity int not null check (setup_complexity between 1 and 5)`
+- `fatigue_cost int not null check (fatigue_cost between 1 and 5)`
+- `unilateral boolean not null default false`
+- `bodyweight_load_type text null check (bodyweight_load_type in ('bodyweight','assisted','external_loadable'))`
+- `substitution_difficulty int not null check (substitution_difficulty between 1 and 5)`
 - `is_active boolean not null default true`
 Constraints: unique `(slug)` and seed row count acceptance test `= 50 active canonical rows`.
 
@@ -320,7 +343,7 @@ Constraints: unique `(slug)` and seed row count acceptance test `= 50 active can
 - `version int not null default 1`
 - `deleted_at timestamptz null`
 Constraints: unique `(user_id, exercise_id) where deleted_at is null`.
-Generator scoring impact (deterministic additive weight): `preferred +25`, `disliked -35`, `locked_in force-include when feasible`, `locked_out hard-exclude`.
+Generator preference interpretation is defined in §6.10 deterministic scoring (single source of truth); do not apply additional implicit weights.
 
 ## 2.20 `user_limitation`
 - `id uuid pk`
@@ -357,13 +380,41 @@ Cross-user denial acceptance criteria: any user B select/update on user A row re
 ## 4) Idempotency ledgers
 
 ### 4.1 `processed_mutation`
-Covers all non-session writes including `PUT /v1/equipment/profiles/{id}/items`.
-- unique `(user_id, mutation_id)`.
-- Replay same hash => return stored response/status.
-- Same mutation_id different hash => `409 MUTATION_ID_REUSE_CONFLICT`.
+- `id uuid pk default gen_random_uuid()`
+- `user_id uuid not null references auth.users(id)`
+- `mutation_id uuid not null`
+- `mutation_hash text not null`
+- `endpoint_scope text not null`
+- `request_body jsonb not null`
+- `response_status int not null`
+- `response_body jsonb not null`
+- `created_at timestamptz not null default now()`
+- `expires_at timestamptz null`
+Constraints: unique `(user_id, mutation_id)`.
 
 ### 4.2 `workout_session_mutation`
-Session execution mutations only (`start`, set-log CRUD/skip, substitution, complete/partial/abandon/skip, recommendation actions tied to session).
+- `id uuid pk default gen_random_uuid()`
+- `user_id uuid not null references auth.users(id)`
+- `workout_session_id uuid not null references workout_session(id)`
+- `mutation_id uuid not null`
+- `mutation_hash text not null`
+- `client_timestamp timestamptz not null`
+- `client_sequence int null`
+- `last_applied_seq int null`
+- `endpoint_scope text not null`
+- `request_body jsonb not null`
+- `response_status int not null`
+- `response_body jsonb not null`
+- `created_at timestamptz not null default now()`
+- `expires_at timestamptz null`
+Constraints: unique `(user_id, workout_session_id, mutation_id)`.
+Index: `(user_id, workout_session_id, created_at desc)`.
+
+Rules (both ledgers where applicable):
+- Same mutation id + same mutation hash => replay stored response/status.
+- Same mutation id + different hash => `409 MUTATION_ID_REUSE_CONFLICT`.
+- Stale `ifMatchVersion` => `409 VERSION_CONFLICT`.
+- Out-of-order local draft sequence (`client_sequence <= last_applied_seq`) => `409 MUTATION_SEQUENCE_CONFLICT`.
 
 ---
 
@@ -388,14 +439,28 @@ Response:
 - `PUT /v1/equipment/profiles/{id}/calendar` request `{entries:[{weekday:1,equipmentProfileId:"uuid"}]}` response `{data:{entries,version}}`.
 
 ### 5.3 Plan generation/regeneration
-- `POST /v1/plans/generate` request `{mutationId,clientTimestamp,goalPlanId,equipmentProfileId,calendarWeekStart}`
+- `POST /v1/plans/generate` request `{mutationId,clientTimestamp,goalPlanId,calendarWeekStart}`
 - `POST /v1/plans/{id}/regenerate` request `{mutationId,clientTimestamp,reason,ifMatchVersion,preserveInProgress:true}`
 Response shape (both):
 ```json
-{"data":{"planVersion":{"id":"uuid","versionNumber":3,"isActive":true,"generateMode":"initial|regenerate"},"workoutDays":[{"id":"uuid","dayIndex":1,"dayLabel":"Push A","estimatedDurationMin":60}],"exerciseInstances":[{"id":"uuid","workoutDayId":"uuid","exerciseId":"uuid","slotIndex":1,"movementIntent":"horizontal_push","trimPriority":1,"optional":false}],"setPrescriptions":[{"id":"uuid","exerciseInstanceId":"uuid","setIndex":1,"repMin":6,"repMax":10,"targetRir":2.0}],"explanations":[{"code":"EQUIPMENT_MATCH","message":"Matched dumbbell profile"}],"warnings":[],"infeasibleErrors":[]}}
+{"data":{"planVersion":{"id":"uuid","versionNumber":3,"isActive":true,"generateMode":"initial|regenerate"},"workoutDays":[{"id":"uuid","dayIndex":1,"dayLabel":"Push A","estimatedDurationMin":60}],"exerciseInstances":[{"id":"uuid","workoutDayId":"uuid","exerciseId":"uuid","slotIndex":1,"movementIntent":"horizontal_push","trimPriority":1,"optional":false}],"setPrescriptions":[{"id":"uuid","exerciseInstanceId":"uuid","setIndex":1,"repMin":6,"repMax":10,"targetRir":2.0}],"scheduledWorkoutSessions":[{"id":"uuid","scheduledForDate":"2026-05-11","weekday":1,"workoutDayId":"uuid","planVersionId":"uuid","status":"not_started"}],"explanations":[{"code":"EQUIPMENT_MATCH","message":"Matched dumbbell profile"}],"warnings":[],"infeasibleErrors":[]}}
 ```
 `infeasibleErrors` must be non-empty when HTTP 422.
 
+
+### 5.3b WorkoutSession materialization model (canonical)
+- `workout_day` rows are plan templates scoped to `plan_version`.
+- `workout_session` rows are dated execution instances and are materialized during `POST /v1/plans/generate` and `POST /v1/plans/{id}/regenerate`.
+- For requested `calendarWeekStart`, backend must materialize one `not_started` `workout_session` per active `training_schedule_entry` row by mapping:
+  1) `training_schedule_entry.day_order` -> template `workout_day.day_index`; 2) `training_schedule_entry.weekday` -> `scheduled_for_date` within the requested week.
+- Today screen reads the materialized row whose `scheduled_for_date == local_today`.
+- Recovery-only fallback: if a valid materialized row is unexpectedly missing, `POST /v1/workout-sessions/start` may lazily create it; this path must emit warning code `SESSION_LAZY_CREATED` in response `meta.warnings`.
+- Missed-session definition: `scheduled_for_date < local_today` and `status='not_started'`; missed recovery actions operate on that existing dated session (no implicit cloning).
+- Rebinding on regeneration:
+  - future `not_started`: eligible for rebind.
+  - same-day `not_started`: eligible unless protected by unsynced local draft.
+  - same-day `in_progress`: never rebound.
+  - past `not_started`: never auto-rebound.
 
 ### 5.4 Workout execution (implementation-ready schemas)
 Common rules for all endpoints below:
@@ -408,14 +473,16 @@ Common rules for all endpoints below:
 - Terminal statuses: `completed|partial|abandoned|skipped|completed_outside_app|deleted`; any set-log mutation in terminal status => `409 INVALID_SESSION_STATE_TRANSITION`.
 
 `POST /v1/workout-sessions/start`
-Request required: `mutationId, clientTimestamp, workoutDayId, scheduledForDate`
-Request optional: `planVersionId` (defaults active), `notes`, `clientRequestId`
+Request required: `mutationId, clientTimestamp, scheduledForDate`
+Request optional: `workoutSessionId`, `workoutDayId`, `planVersionId` (defaults active), `notes`, `clientRequestId`
 Response 201:
 ```json
 {"data":{"workoutSession":{"id":"uuid","userId":"uuid","planVersionId":"uuid","workoutDayId":"uuid","scheduledForDate":"2026-05-10","status":"in_progress","startedAt":"ISO-8601","version":1},"idMap":{}},"meta":{"mutationId":"uuid","replayed":false}}
 ```
 Idempotency: replay returns same session id/status/version.
-Transition: synthetic `not_started -> in_progress` on create.
+Transition rules:
+- If `workoutSessionId` references existing materialized `not_started` session for user/date, transition `not_started -> in_progress` (no new row).
+- If no valid materialized session exists, create recovery row then transition to `in_progress` in same transaction.
 
 `POST /v1/workout-sessions/{id}/set-logs`
 Request required: `mutationId, clientTimestamp, ifMatchVersion, setLog:{exerciseInstanceId,setSource,setIndex}`
@@ -474,7 +541,7 @@ Allowed session status transitions:
 
 Standard error payload:
 ```json
-{"error":{"code":"VERSION_CONFLICT|INVALID_SESSION_STATE_TRANSITION|MUTATION_ID_REUSE_CONFLICT|DRAFT_CONFLICT|FOREIGN_LINK_CONFLICT","message":"...","details":{}},"meta":{"mutationId":"uuid","replayed":false}}
+{"error":{"code":"VERSION_CONFLICT|INVALID_SESSION_STATE_TRANSITION|MUTATION_ID_REUSE_CONFLICT|MUTATION_SEQUENCE_CONFLICT|DRAFT_CONFLICT|FOREIGN_LINK_CONFLICT","message":"...","details":{}},"meta":{"mutationId":"uuid","replayed":false}}
 ```
 `DRAFT_CONFLICT` details must include authoritative mapping metadata:
 `{sessionId,serverPlanVersionId,clientPlanVersionId,lastAppliedSeq,idMap,conflictingOps:[opId...]}`.
@@ -557,6 +624,59 @@ Beginner reductions are deterministic: same slot order as intermediate; apply `s
 - Push B: `horizontal_push(3,8-12,p1)`, `vertical_push(3,8-12,p2)`, `elbow_extension_isolation(3,10-15,p3)`, `lateral_raise_pattern(3,12-20,p4,opt)`
 - Pull B: `horizontal_pull(4,6-10,p1)`, `vertical_pull(3,8-12,p2)`, `elbow_flexion_isolation(3,10-15,p3)`, `rear_delt_raise_pattern(3,12-20,p4,opt)`
 - Legs B: `hip_thrust_pattern(4,6-10,p1)`, `lunge_pattern(3,8-12,p2)`, `knee_flexion_isolation(3,10-15,p3)`, `core_anti_rotation(3,10-15,p3)`
+### 6.9 Plan generation inputs for schedule/equipment resolution
+For `POST /v1/plans/generate`, backend derives all inputs (no direct equipment profile input):
+1. Active `goal_plan` by `goalPlanId`.
+2. Active `training_schedule_entry` rows for that goal plan.
+3. Active `equipment_calendar_entry` rows by weekday.
+4. Active `equipment_profile_item` rows from selected weekday profile.
+5. Active user limitations and exercise preferences.
+6. Prior plan context when regenerating.
+
+Generator must deterministically derive:
+- training weekdays from `training_schedule_entry.weekday`.
+- workout order from `training_schedule_entry.day_order`.
+- day-specific equipment profile by joining `weekday` to `equipment_calendar_entry`.
+
+### 6.10 Deterministic exercise filtering + scoring (canonical)
+Hard filters (in order):
+1. Exclude unavailable equipment.
+2. Exclude contraindicated by active limitations.
+3. Exclude `locked_out` preferences.
+4. Exclude `experience_min` above user level unless no feasible alternative exists for the slot; if fallback used, add warning.
+5. Exclude inactive exercises.
+
+Scoring (additive after filters):
+- same `movement_intent`: `+40`
+- same primary muscle as slot target: `+25`
+- beginner user + `beginner_friendly=true`: `+15`
+- matches focus muscle: `+10`
+- user preferred: `+10`
+- prior successful history: `+8`
+- low setup complexity when `session_length_min <= 45` and `setup_complexity <= 2`: `+5`
+- high fatigue cost on back-to-back training day (`fatigue_cost >=4`): `-10`
+- user disliked: `-30`
+- recently skipped repeatedly: `-20`
+- `locked_in`: force include when feasible; if infeasible return warning with reason.
+
+Computed terms:
+- prior successful history = user has >=2 completed or partial sessions in trailing 56 days containing same `exercise_id` with median logged RIR in [1,3] and completion rate >=80% for prescribed sets.
+- recently skipped repeatedly = same `exercise_id` skipped in >=2 of last 3 sessions where it appeared, within trailing 42 days.
+- back-to-back training day = current training weekday immediately follows another active training weekday in the same week order (difference 1 day, or Sunday->Monday wrap).
+- prior adherence (tie-break key #5) = completion ratio of prescribed sets for this exercise over trailing 56 days; null treated as 0.
+
+Tie-breakers (strict order):
+1. higher score
+2. lower setup complexity
+3. `beginner_friendly=true` over false
+4. lower fatigue cost
+5. better prior adherence
+6. fewer appearances in current plan being generated
+7. lexicographic `exercise_catalog.slug`
+8. lexicographic UUID string of `exercise_catalog.id`
+
+All sorting must be stable and deterministic with explicit NULL handling (`NULLS LAST` unless noted above).
+
 ---
 
 ## 7) Set prescription/log linkage, cross-entity integrity, and substitution rules
@@ -618,6 +738,21 @@ Auditability requirements:
 11. Workout execution mutation replay with same mutation ID but different hash returns `409 MUTATION_ID_REUSE_CONFLICT`.
 12. `completed_outside_app` is terminal and blocks subsequent in-app set logging/substitution endpoints with `409 INVALID_SESSION_STATE_TRANSITION`.
 13. Equipment item full-replace persists and removes omitted items.
+14. Monday/Wednesday/Friday training schedule yields exactly three materialized sessions on weekdays 1/3/5 for target week.
+15. Different Monday vs Friday equipment profiles produce different eligibility sets and selected exercises when constraints differ.
+16. Regeneration creates new `plan_version` and rebinds only future + same-day eligible `not_started` sessions.
+17. Regeneration does not rebind same-day `in_progress` sessions.
+18. Regeneration returns `409 DRAFT_CONFLICT` when unsynced local draft mutations are reported.
+19. Starting existing materialized `not_started` session transitions to `in_progress` without creating new row.
+20. Missed workout detection flags sessions where `scheduled_for_date < local_today` and status `not_started`.
+21. Duplicate mutation id + same hash replays stored response.
+22. Duplicate mutation id + different hash returns `409 MUTATION_ID_REUSE_CONFLICT`.
+23. Out-of-order local draft sequence returns `409 MUTATION_SEQUENCE_CONFLICT`.
+24. `exercise_instance.exercise_id` FK rejects nonexistent exercise id.
+25. Generator scoring is deterministic for fixed input snapshot.
+26. Tie-breakers choose identical exercise across repeated runs with equal scores.
+27. Seed catalog contains exactly 50 active exercises, all required scoring metadata populated, unique slugs, deterministic UUIDs.
+28. Every template movement intent has at least two feasible exercises across common home and gym equipment profiles.
 14. Body weight uniqueness on `(user_id, logged_on)` enforced.
 15. Weekly trend matches 7-day window formula.
 16. `notification_preference` RLS blocks cross-user reads/writes; owner can read/update own row only.
@@ -647,3 +782,10 @@ Rules:
 - Conflict: if `baseSessionVersion` stale, server returns `409 VERSION_CONFLICT` + latest session projection and accepted `lastAppliedSeq`.
 - Client/server ID reconciliation: response returns `idMap` for local IDs (`clientSetLogId`,`clientItemId`,`draftId`) to canonical UUIDs.
 - Apply is atomic per op; partial success within one op is forbidden.
+
+
+## 11) Canonical seed artifact requirements
+- Canonical seed file is `db/seeds/001_exercises_canonical_50.sql` and is part of implementation contract scope.
+- The seed must insert/update exactly 50 `is_active=true` rows with deterministic UUIDs and unique slugs.
+- Each row must populate: `id,slug,name,movement_intent,equipment_key,primary_muscles,secondary_muscles,contraindication_tags,instruction_cues,safety_cues,experience_min,beginner_friendly,setup_complexity,fatigue_cost,unilateral,bodyweight_load_type,substitution_difficulty,is_active`.
+- Contract acceptance requires generator tests to pass using only this seed catalog (no fallback hidden exercises).
