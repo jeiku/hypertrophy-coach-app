@@ -1,6 +1,6 @@
 # CANONICAL DATA AND PLAN GENERATION CONTRACT (FINAL MVP BUILD CONTRACT)
 
-**Status:** Draft contract revision; implementation-ready for engineering estimation and architecture freeze (see §10 A/B checked items). Production implementation remains gated by §10.C PRD pre-build sign-off.  
+**Status:** Draft contract revision; eligible for engineering estimation and architecture review only after §9 open decisions are fully closed and §10.A–§10.B are checked. Architecture-freeze readiness cannot be marked complete while PRD open decisions remain unresolved. Production implementation remains blocked until §10.C.1 (PRD §0 pre-build gates passed and signed off) is true.  
 **Source of truth:** `PRDv0.6.md`  
 **Revision date:** 2026-05-10
 
@@ -242,6 +242,9 @@ Columns:
 - `push_opt_in boolean not null default true`
 - `workout_reminder_enabled boolean not null default true`
 - `workout_reminder_minutes_before integer not null default 30 check (workout_reminder_minutes_before between 5 and 1440)`
+- `missed_workout_follow_up_enabled boolean not null default true`
+- `recommendation_pending_review_enabled boolean not null default true`
+- `streak_milestone_enabled boolean not null default true`
 - `quiet_hours_enabled boolean not null default true`
 - `quiet_hours_start_local time not null default '21:00:00'`
 - `quiet_hours_end_local time not null default '08:00:00'`
@@ -771,10 +774,15 @@ Invalid transitions: `422 INVALID_STATE_TRANSITION`.
 ### 3.7 Notification preferences
 17) `GET /v1/notification-preferences` -> `200` full preference object.
 18) `PATCH /v1/notification-preferences`
-- Body: `{ "versionToken":2, "pushOptIn":true, "workoutReminderEnabled":true, "workoutReminderMinutesBefore":30, "quietHoursEnabled":true, "quietHoursStartLocal":"21:00:00", "quietHoursEndLocal":"08:00:00", "timezone":"America/New_York" }`
+- Body: `{ "versionToken":2, "pushOptIn":true, "workoutReminderEnabled":true, "workoutReminderMinutesBefore":30, "missedWorkoutFollowUpEnabled":true, "recommendationPendingReviewEnabled":true, "streakMilestoneEnabled":true, "quietHoursEnabled":true, "quietHoursStartLocal":"21:00:00", "quietHoursEndLocal":"08:00:00", "timezone":"America/New_York" }`
 - Success `200` with token+1.
 
 ### 3.8 Recommendation actions
+MVP bounded schema requirement for recommendation explainability fields:
+- `triggerFactors` object allowlist keys: `progression_signal`, `pain_safety_signal`, `deload_signal`, `hold_signal`, `reduce_signal`, `substitution_signal`, `missed_workout_recovery_signal`.
+- Each key maps to `{ active:boolean, source:string, threshold?:string, windowDays?:number }`; additional keys forbidden in MVP v1.
+- `inputsUsed` allowlist arrays: `recent_performance`, `post_workout_checkins`, `missed_workout_count`, `equipment_availability`, `limitation_flags`, `goal_schedule_context`.
+- Unknown keys must fail validation with `422 INVALID_RECOMMENDATION_SCHEMA`; future extensibility via explicit versioned schema upgrade only.
 19) `POST /v1/recommendations/{id}/accept` Body `{ "versionToken":2 }` -> `200` status accepted.
 20) `POST /v1/recommendations/{id}/ignore` Body `{ "versionToken":2, "ignoredReason":"not_today" }` -> `200` ignored.
 21) `POST /v1/recommendations/{id}/dismiss` Body `{ "versionToken":2 }` -> `200` dismissed.
@@ -803,6 +811,118 @@ Invalid transitions: `422 INVALID_STATE_TRANSITION`.
 
 RLS/ownership expectations for all endpoints: authenticated user may only read/write rows where `row.user_id = auth.uid()`; cross-user attempts return `403 FORBIDDEN_RESOURCE`; same-user invalid FK chain returns `422 FK_OWNERSHIP_VIOLATION`.
 `§3.A`, `§3.B`, and `§3.C` are integrated normative subsections of §3 (not appendices) and define the strict implementation-ready schemas for every endpoint listed in §3.1–§3.11 and §3.C.1–§3.C.8, including method/path/auth/headers/request/response/errors/idempotency/versionToken/RLS/transaction notes.
+
+
+### 3.12 Endpoint schema expansion (integrated from former §3.A)
+ (authoritative supplement to §3.1–§3.11)
+For each endpoint in §3, the following are mandatory and not optional: method/path, auth, required headers, strict request schema, strict success schema, error codes, idempotency behavior, versionToken behavior, transaction notes, RLS ownership checks.
+
+#### 3.12.1 Shared request/response envelopes
+- Request headers for authenticated mutable endpoints: `Authorization`, `Content-Type: application/json`, `Idempotency-Key`.
+- Success envelope: `{ "data": <resource>, "meta": { "requestId": "uuid", "idempotencyReplay": false } }`.
+- Error envelope: `{ "error": { "code": "...", "message": "...", "details": {...} } }`.
+
+#### 3.12.2 Full schema obligations by endpoint group
+- Plans endpoints (§3.1): body must include all required IDs, optional fields explicitly nullable; response must include planVersion with workoutDays[] -> exercises[] -> setPrescriptions[] and `planExplanation`, `validationWarnings`, `movementCoverageSummary`.
+- Workout session endpoints (§3.2): response includes `status`, `versionToken`, `startedAt`, `endedAt`, `scheduledForDate`.
+- Set logs endpoint (§3.3): entries require `clientMutationId`, `exerciseInstanceId`, `setSource`, `setLogIndex`, reps/load/RIR fields; `setPrescriptionId` required only for prescribed sets.
+- Recovery endpoint (§3.4): includes action enum, optional targetDate, and explicit `versionToken`; returns both updated session and optional created planVersion summary.
+- Limitations endpoints (§3.5): enforce typed arrays for affected muscles/equipment, versionToken on patch/resolve.
+- Post-workout check-in (§3.6): full schema required with pain conditional validation.
+- Notification endpoints (§3.7): patch requires versionToken and timezone string.
+- Recommendation actions (§3.8): include versionToken; ignore requires `ignoredReason` enum.
+- Equipment item deletion (§3.9): requires `equipmentProfileVersionToken`; returns incremented parent token.
+- Public sample plan (§3.10): no auth, no user-owned writes, rate limits.
+- Local draft recovery (§3.11): strict local draft schema in §3.B.
+
+#### 3.12.3 Endpoint-level idempotency and versionToken behavior
+- `POST /v1/plans/generate`: idempotent by key+body; no versionToken required.
+- `POST /v1/plans/{id}/accept|regenerate|revert`: require versionToken; stale -> `409 VERSION_CONFLICT`.
+- `POST /v1/workout-sessions/start`: idempotent create by key+day+date.
+- `POST /v1/workout-sessions/{id}/resume|finish|mark-partial|skip|complete-outside-app`: require versionToken; duplicate key replay returns same transition result.
+- `POST /v1/workout-sessions/{id}/set-logs`: dedupe by `(user_id, workout_session_id, client_mutation_id)`; replay returns prior row IDs.
+- `PUT /v1/workout-sessions/{id}/post-workout-check-in`: idempotent upsert semantics by session.
+- `PATCH /v1/notification-preferences`, limitation patch/resolve, recommendation actions: optimistic concurrency required.
+
+### 3.13 Local draft recovery schema and conflict matrix (integrated from former §3.B)
+ (full schema and conflict matrix)
+Local draft payload schema:
+- `localDraftId string not null`
+- `planVersionId uuid not null`
+- `workoutDayId uuid not null`
+- `workoutSessionId uuid null`
+- `startedAt timestamptz not null`
+- `completedSetLogs[]` each with `clientMutationId`, `exerciseInstanceId`, `setSource`, `setLogIndex`, `setPrescriptionId?`, `performedReps?`, `performedLoad?`, `loadUnit?`, `rir?`, `setState`.
+- `skippedExercises[]` with `exerciseInstanceId`, `reason?`
+- `skippedSets[]` with `exerciseInstanceId`, `setLogIndex`, `reason?`
+- `notes string null`
+- `lastSavedAt timestamptz not null`
+- `syncStatus enum('not_synced','partially_synced','synced','conflicted')`
+- `sessionVersionToken integer null`
+
+Recovery path A (existing workoutSessionId):
+1) validate ownership and session open state.
+2) validate `planVersionId/workoutDayId` chain equals existing session.
+3) apply idempotent set log upserts by `clientMutationId`.
+4) return `duplicateClientMutationIds[]` and accepted IDs.
+
+Recovery path B (creation context before first sync):
+1) create session from `planVersionId+workoutDayId+scheduledForDate(derived)` in transaction.
+2) insert recovered set logs/check-in snapshot.
+3) return created `workoutSessionId` and server `versionToken`.
+
+Conflict handling codes:
+- `SESSION_ALREADY_COMPLETED`: do not append logs; return latest server session snapshot.
+- `PLAN_VERSION_MISMATCH`: reject with expected/current IDs.
+- `WORKOUT_DAY_MISMATCH`: reject with expected/current IDs.
+- `STALE_VERSION_TOKEN`: reject with `currentVersionToken`.
+- `DUPLICATE_CLIENT_MUTATION_ID`: non-fatal replay list in success payload.
+- `PARTIAL_SYNC_CONFLICT`: return merged summary + unresolved item list.
+
+### 3.14 Missing MVP endpoint contracts (integrated from former §3.C)
+ (authoritative supplement to §3)
+
+#### 3.14.1 User profile / onboarding
+- `PUT /v1/user-profile`
+  - Request: `{ versionToken?: number, birthDate?: date|null, sex?: enum|null, heightCm?: number|null, bodyWeight?: number|null, bodyWeightUnit?: kg|lb|null, experienceLevel?: beginner|intermediate|null, timezone: string, onboardingCompletedAt?: timestamptz|null }`
+  - Success: `{ data: { ...userProfile, versionToken:number } }`
+  - Errors: `422` invalid ranges/combinations, `409 VERSION_CONFLICT`, `403` cross-user.
+  - Idempotency/versioning: requires `Idempotency-Key`; create path may omit versionToken, update path requires exact current token.
+  - RLS: only `user_profile.user_id=auth.uid()` row.
+
+#### 3.14.2 Goal plan CRUD
+- `POST /v1/goal-plans`, `PATCH /v1/goal-plans/{id}` with strict fields from §2.2.
+- Active-goal uniqueness enforced transactionally; update/archive prior active in same transaction.
+
+#### 3.14.3 Equipment profile and items
+- `POST /v1/equipment-profiles`, `PATCH /v1/equipment-profiles/{id}`, `DELETE /v1/equipment-profiles/{id}` (soft-delete/archive only if referenced).
+- `POST /v1/equipment-profiles/{id}/items` request `{ equipmentProfileVersionToken:number, equipmentKey:string }`.
+- Delete item endpoint in §3.9 remains authoritative; add endpoint follows same parent token bump semantics.
+
+#### 3.14.4 Exercise catalog read APIs
+- `GET /v1/exercises?movementIntent=&equipmentKey=&limit=&cursor=` and `GET /v1/exercises/{id}`.
+- Read-only through API proxy to seed tables; direct client table access is allowed only read (`is_active=true`) under RLS.
+
+#### 3.14.5 Exercise preference CRUD
+- `POST /v1/exercise-preferences`, `PATCH /v1/exercise-preferences/{id}`, `DELETE /v1/exercise-preferences/{id}` using §2.7 schema and versionToken for patch/delete.
+
+#### 3.14.6 Substitution candidates + apply
+- `POST /v1/substitutions/candidates`
+  - Request: `{ planVersionId:uuid, workoutDayId:uuid, exerciseInstanceId:uuid, context:'future_plan'|'session_override', painLocation?:pain_location[], unavailableEquipmentKeys?:string[], versionToken:number }`
+  - Success: `{ data:{ candidates:[{ exerciseCatalogId:uuid, score:number, whyThisSubstitution:{ movementIntentMatch:boolean, equipmentCompatible:boolean, painSuppressionApplied:boolean, fatigueComparison:string, historyLoadHint?:string|null } }], suppressedByPainMapping:boolean } }`
+- `POST /v1/substitutions/apply`
+  - Request: `{ targetContext:'future_plan'|'session_override', planVersionId:uuid, workoutDayId?:uuid, workoutSessionId?:uuid, exerciseInstanceId:uuid, replacementExerciseCatalogId:uuid, versionToken:number }`
+  - Success: `{ data:{ substitutionId:uuid, mutationType:'replace_future_exercise_instance'|'session_level_override', newExerciseInstanceId?:uuid, preservedOriginalExerciseInstanceId:uuid } }`
+  - Mutation rule: future-plan applies by creating replacement `exercise_instance` row and retiring original from future view; session override writes through `exercise_substitution.session_override_payload` only (no separate `session_exercise_override` entity in MVP). Completed workout history and completed set logs are never rewritten.
+
+#### 3.14.7 Recommendation action ignoredReason other text
+- `POST /v1/recommendations/{id}/ignore` request extends to `{ versionToken:number, ignoredReason:enum, ignoredReasonText?:string|null }`; `ignoredReasonText` required when `ignoredReason='other'`.
+
+#### 3.14.8 Transaction/RPC notes for endpoint groups
+- Workout-session status transitions are RPC-only (`rpc_transition_workout_session`).
+- Recommendation accept/ignore/dismiss are RPC-only (`rpc_apply_recommendation_action`).
+- Set logs are append/idempotent insert only via RPC (`rpc_append_set_logs`); no client update/delete contract.
+
 
 ---
 
@@ -861,140 +981,8 @@ Trigger responsibilities:
 - increment `version_token` exactly +1 on mutable updates.
 - enforce parent-child ownership invariants.
 - bump `equipment_profile.version_token` on item create/update/delete.
-
----
-
-## 6) Acceptance tests mapped to risk
-
-Must-pass tests:
-1. Full schema DDL tests for all tables in §2.
-2. `version_token` stale write (`409`) and +1 increment on success across all mutable tables.
-3. Endpoint contract tests with request/response/error examples for all 24 endpoints.
-4. Regeneration safety matrix behavior tests for each session status and unsynced draft scenarios.
-5. Local draft recovery conflict and duplicate `clientMutationId` replay tests.
-6. RLS tests: cross-user denied (`403`), same-user wrong chain (`422`).
-7. FK invariants tests for session/day/plan and set_log references.
-8. Notification quiet-hours (9pm–8am local), timezone handling, defaults (`pushOptIn=true`, reminder 30).
-9. Equipment taxonomy enforcement (`equipment_key` must exist in `equipment_catalog`) and parent token bump on item mutations.
-10. Exercise seed verification: catalog populated with ~80 curated exercises.
-
----
-
-## 7) Idempotency and concurrency
-
-- Idempotent endpoints require `Idempotency-Key`; server stores hash(user, route, key, request-body-signature) for 24h.
-- Replayed identical request returns same status/body.
-- Reused key with different body returns `409 IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD`.
-- Mutable updates with versioning require matching `versionToken`; stale -> `409 VERSION_CONFLICT` with `currentVersionToken`.
-
----
-
-## 8) Ownership summary (API camelCase mapping)
-
-All exposed mutable entities include `versionToken` in API: `userProfile`, `goalPlan`, `equipmentProfile`, `userExercisePreference`, `userLimitation`, `notificationPreference`, `planVersion`, `workoutSession`, `postWorkoutCheckIn`, `recommendation`.
-
----
-
-## 9) Open decisions inherited from PRD
-
-Blocking decisions outside this contract (if unresolved in PRD) must remain flagged:
-- exact curated exercise count if product insists on exact number (contract currently uses ~80).
-- final allowed recommendation `triggerFactors/inputsUsed` JSON schemas if PRD leaves structure flexible.
-
----
-
-## 10) Implementation readiness checklist
-
-### A) Contract-complete for engineering estimation
-- [x] All MVP schemas fully defined (columns/types/nullability/defaults/enums/FKs/uniques/checks/indexes/ownership/versioning/API mapping).
-- [x] All endpoints include method/path/auth/headers/request-success-errors/versionToken/idempotency/RLS/transaction notes.
-- [x] Regeneration and local-draft safety matrix fully specified.
-
-### B) Architecture-freeze ready
-- [x] RLS/FK/trigger/RPC enforcement finalized with explicit per-table permissions and domain errors.
-- [x] Acceptance tests mapped to high-risk flows and invariants.
-- [x] PRD open decisions either resolved or explicitly listed as blockers.
-
-### C) Production implementation ready
-- [ ] PRD §0 pre-build gates are passed and signed off; production implementation remains blocked until this is true.
-- [ ] Migration DDL generated exactly from this contract.
-- [ ] RPCs implement all state transitions and idempotency semantics.
-- [ ] Integration/e2e suite passes all §6 tests in CI.
-- [x] No placeholder language remains.
-
-
-## 11) Patch Summary
-- Sections amended: §1 status, §2.6 (`cue_safety_note` nullability), §2.16 (`soreness_location` nullability + API consistency), §3 ownership/error invariants and normative integration statement, §5.A explicit per-table RLS matrix, §10 readiness checklist.
-- Sections added: §2.18 `exercise_substitution` persistence model (future-plan + session-level substitution with FK/ownership/versioning/immutability semantics).
-- Sections moved: none; supplemental sections §3.A/§3.B/§3.C, §5.A, and §6.A are explicitly integrated into parent normative sections by wording updates.
-- Sections deleted: none. No implementation-critical schema/API/RLS/sync/state-machine/generator/progression/acceptance-test content was removed.
-- Remaining blockers before production implementation readiness: §10.C items (migration generation, RPC implementation, CI e2e pass, PRD pre-build gates) remain execution tasks and are intentionally unchecked.
-
-## 3.A) Endpoint schema expansion (authoritative supplement to §3.1–§3.11)
-For each endpoint in §3, the following are mandatory and not optional: method/path, auth, required headers, strict request schema, strict success schema, error codes, idempotency behavior, versionToken behavior, transaction notes, RLS ownership checks.
-
-### 3.A.1 Shared request/response envelopes
-- Request headers for authenticated mutable endpoints: `Authorization`, `Content-Type: application/json`, `Idempotency-Key`.
-- Success envelope: `{ "data": <resource>, "meta": { "requestId": "uuid", "idempotencyReplay": false } }`.
-- Error envelope: `{ "error": { "code": "...", "message": "...", "details": {...} } }`.
-
-### 3.A.2 Full schema obligations by endpoint group
-- Plans endpoints (§3.1): body must include all required IDs, optional fields explicitly nullable; response must include planVersion with workoutDays[] -> exercises[] -> setPrescriptions[] and `planExplanation`, `validationWarnings`, `movementCoverageSummary`.
-- Workout session endpoints (§3.2): response includes `status`, `versionToken`, `startedAt`, `endedAt`, `scheduledForDate`.
-- Set logs endpoint (§3.3): entries require `clientMutationId`, `exerciseInstanceId`, `setSource`, `setLogIndex`, reps/load/RIR fields; `setPrescriptionId` required only for prescribed sets.
-- Recovery endpoint (§3.4): includes action enum, optional targetDate, and explicit `versionToken`; returns both updated session and optional created planVersion summary.
-- Limitations endpoints (§3.5): enforce typed arrays for affected muscles/equipment, versionToken on patch/resolve.
-- Post-workout check-in (§3.6): full schema required with pain conditional validation.
-- Notification endpoints (§3.7): patch requires versionToken and timezone string.
-- Recommendation actions (§3.8): include versionToken; ignore requires `ignoredReason` enum.
-- Equipment item deletion (§3.9): requires `equipmentProfileVersionToken`; returns incremented parent token.
-- Public sample plan (§3.10): no auth, no user-owned writes, rate limits.
-- Local draft recovery (§3.11): strict local draft schema in §3.B.
-
-### 3.A.3 Endpoint-level idempotency and versionToken behavior
-- `POST /v1/plans/generate`: idempotent by key+body; no versionToken required.
-- `POST /v1/plans/{id}/accept|regenerate|revert`: require versionToken; stale -> `409 VERSION_CONFLICT`.
-- `POST /v1/workout-sessions/start`: idempotent create by key+day+date.
-- `POST /v1/workout-sessions/{id}/resume|finish|mark-partial|skip|complete-outside-app`: require versionToken; duplicate key replay returns same transition result.
-- `POST /v1/workout-sessions/{id}/set-logs`: dedupe by `(user_id, workout_session_id, client_mutation_id)`; replay returns prior row IDs.
-- `PUT /v1/workout-sessions/{id}/post-workout-check-in`: idempotent upsert semantics by session.
-- `PATCH /v1/notification-preferences`, limitation patch/resolve, recommendation actions: optimistic concurrency required.
-
-## 3.B) Local draft recovery (full schema and conflict matrix)
-Local draft payload schema:
-- `localDraftId string not null`
-- `planVersionId uuid not null`
-- `workoutDayId uuid not null`
-- `workoutSessionId uuid null`
-- `startedAt timestamptz not null`
-- `completedSetLogs[]` each with `clientMutationId`, `exerciseInstanceId`, `setSource`, `setLogIndex`, `setPrescriptionId?`, `performedReps?`, `performedLoad?`, `loadUnit?`, `rir?`, `setState`.
-- `skippedExercises[]` with `exerciseInstanceId`, `reason?`
-- `skippedSets[]` with `exerciseInstanceId`, `setLogIndex`, `reason?`
-- `notes string null`
-- `lastSavedAt timestamptz not null`
-- `syncStatus enum('not_synced','partially_synced','synced','conflicted')`
-- `sessionVersionToken integer null`
-
-Recovery path A (existing workoutSessionId):
-1) validate ownership and session open state.
-2) validate `planVersionId/workoutDayId` chain equals existing session.
-3) apply idempotent set log upserts by `clientMutationId`.
-4) return `duplicateClientMutationIds[]` and accepted IDs.
-
-Recovery path B (creation context before first sync):
-1) create session from `planVersionId+workoutDayId+scheduledForDate(derived)` in transaction.
-2) insert recovered set logs/check-in snapshot.
-3) return created `workoutSessionId` and server `versionToken`.
-
-Conflict handling codes:
-- `SESSION_ALREADY_COMPLETED`: do not append logs; return latest server session snapshot.
-- `PLAN_VERSION_MISMATCH`: reject with expected/current IDs.
-- `WORKOUT_DAY_MISMATCH`: reject with expected/current IDs.
-- `STALE_VERSION_TOKEN`: reject with `currentVersionToken`.
-- `DUPLICATE_CLIENT_MUTATION_ID`: non-fatal replay list in success payload.
-- `PARTIAL_SYNC_CONFLICT`: return merged summary + unresolved item list.
-
-## 5.A) RLS/FK/trigger/RPC enforcement expansion (per-table matrix required)
+### 5.1 RLS/FK/trigger/RPC enforcement expansion (integrated from former §5.A)
+ RLS/FK/trigger/RPC enforcement expansion (per-table matrix required)
 Per-table RLS matrix (explicit):
 - `user_profile`: client select ✅ insert ✅ update ✅ delete ❌; RPC-only writes ❌; service-role-only writes ❌; policy `USING (user_id=auth.uid()) WITH CHECK (user_id=auth.uid())`.
 - `goal_plan`: select ✅ insert ✅ update ✅ delete ✅(soft-delete); RPC-only writes ❌; service-only ❌; same policy.
@@ -1037,7 +1025,30 @@ FK chain validation examples:
 - set log prescribed chain: `set_log.workout_session_id -> workout_session.workout_day_id -> exercise_instance.workout_day_id`, and `set_log.set_prescription_id -> set_prescription.exercise_instance_id == set_log.exercise_instance_id`.
 - same-user wrong chain returns `422 FK_OWNERSHIP_VIOLATION` even when user owns both rows independently.
 
-## 6.A) Concrete Given/When/Then acceptance tests
+
+---
+
+## 6) Acceptance tests mapped to risk
+
+Must-pass tests:
+1. Full schema DDL tests for all tables in §2.
+2. `version_token` stale write (`409`) and +1 increment on success across all mutable tables.
+3. Endpoint contract tests with request/response/error examples for all 24 endpoints.
+4. Regeneration safety matrix behavior tests for each session status and unsynced draft scenarios.
+5. Local draft recovery conflict and duplicate `clientMutationId` replay tests.
+6. RLS tests: cross-user denied (`403`), same-user wrong chain (`422`).
+7. FK invariants tests for session/day/plan and set_log references.
+8. Notification quiet-hours (9pm–8am local), timezone handling, defaults (`pushOptIn=true`, reminder 30).
+9. Equipment taxonomy enforcement (`equipment_key` must exist in `equipment_catalog`) and parent token bump on item mutations.
+10. Exercise seed verification: catalog populated with ~80 curated exercises.
+11. Notification preferences cover workout reminder, missed-workout follow-up, recommendation-pending review, streak milestone; quiet-hours suppression enforced in user timezone for each type.
+12. Analytics allowlist enforcement rejects non-allowlisted events and blocks payloads containing prohibited PII/sensitive fields.
+13. Trust survey week-4 capture persists rating (1..5) and enables trust-survey metric query.
+14. Recommendation `triggerFactors` and `inputsUsed` schema validator accepts allowlisted keys and rejects unknown keys.
+15. Substitution endpoints enforce `future_plan` vs `session_override` behavior and guarantee completed workout history/set logs are never rewritten.
+16. Readiness checklist test fails if §10.B marked complete while §9 open decisions remain unresolved.
+### 6.1 Concrete Given/When/Then acceptance tests (integrated from former §6.A)
+ Concrete Given/When/Then acceptance tests
 - Given two same-day slots and identical top candidate, when generator assigns slot2, then cross-slot exclusion picks next candidate.
 - Given 4-day split and previous workout used exercise X for horizontal_push, when next same-intent day generated, then X not reused unless option pool <2.
 - Given missing equipment for vertical_pull and no eligible alternatives, when generating, then slot marked unfilled and warning emitted.
@@ -1058,45 +1069,91 @@ FK chain validation examples:
 - Given same user but plan/day mismatch chain, when set log inserted, then `422 FK_OWNERSHIP_VIOLATION`.
 - Given exercise seed load, when validation test runs, then ~80 exercises exist with 6-10 options per movement intent per common equipment profile and all cue/timing fields non-null.
 
-## 3.C) Missing MVP endpoint contracts (authoritative supplement to §3)
 
-### 3.C.1 User profile / onboarding
-- `PUT /v1/user-profile`
-  - Request: `{ versionToken?: number, birthDate?: date|null, sex?: enum|null, heightCm?: number|null, bodyWeight?: number|null, bodyWeightUnit?: kg|lb|null, experienceLevel?: beginner|intermediate|null, timezone: string, onboardingCompletedAt?: timestamptz|null }`
-  - Success: `{ data: { ...userProfile, versionToken:number } }`
-  - Errors: `422` invalid ranges/combinations, `409 VERSION_CONFLICT`, `403` cross-user.
-  - Idempotency/versioning: requires `Idempotency-Key`; create path may omit versionToken, update path requires exact current token.
-  - RLS: only `user_profile.user_id=auth.uid()` row.
+---
 
-### 3.C.2 Goal plan CRUD
-- `POST /v1/goal-plans`, `PATCH /v1/goal-plans/{id}` with strict fields from §2.2.
-- Active-goal uniqueness enforced transactionally; update/archive prior active in same transaction.
+## 7) Idempotency and concurrency
 
-### 3.C.3 Equipment profile and items
-- `POST /v1/equipment-profiles`, `PATCH /v1/equipment-profiles/{id}`, `DELETE /v1/equipment-profiles/{id}` (soft-delete/archive only if referenced).
-- `POST /v1/equipment-profiles/{id}/items` request `{ equipmentProfileVersionToken:number, equipmentKey:string }`.
-- Delete item endpoint in §3.9 remains authoritative; add endpoint follows same parent token bump semantics.
+- Idempotent endpoints require `Idempotency-Key`; server stores hash(user, route, key, request-body-signature) for 24h.
+- Replayed identical request returns same status/body.
+- Reused key with different body returns `409 IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD`.
+- Mutable updates with versioning require matching `versionToken`; stale -> `409 VERSION_CONFLICT` with `currentVersionToken`.
 
-### 3.C.4 Exercise catalog read APIs
-- `GET /v1/exercises?movementIntent=&equipmentKey=&limit=&cursor=` and `GET /v1/exercises/{id}`.
-- Read-only through API proxy to seed tables; direct client table access is allowed only read (`is_active=true`) under RLS.
+---
 
-### 3.C.5 Exercise preference CRUD
-- `POST /v1/exercise-preferences`, `PATCH /v1/exercise-preferences/{id}`, `DELETE /v1/exercise-preferences/{id}` using §2.7 schema and versionToken for patch/delete.
+## 8) Ownership summary (API camelCase mapping)
 
-### 3.C.6 Substitution candidates + apply
-- `POST /v1/substitutions/candidates`
-  - Request: `{ planVersionId:uuid, workoutDayId:uuid, exerciseInstanceId:uuid, context:'future_plan'|'scheduled_session', painLocation?:pain_location[], unavailableEquipmentKeys?:string[], versionToken:number }`
-  - Success: `{ data:{ candidates:[{ exerciseCatalogId:uuid, score:number, whyThisSubstitution:{ movementIntentMatch:boolean, equipmentCompatible:boolean, painSuppressionApplied:boolean, fatigueComparison:string, historyLoadHint?:string|null } }], suppressedByPainMapping:boolean } }`
-- `POST /v1/substitutions/apply`
-  - Request: `{ targetContext:'future_plan'|'session_override', planVersionId:uuid, workoutDayId?:uuid, workoutSessionId?:uuid, exerciseInstanceId:uuid, replacementExerciseCatalogId:uuid, versionToken:number }`
-  - Success: `{ data:{ substitutionId:uuid, mutationType:'replace_future_exercise_instance'|'session_level_override', newExerciseInstanceId?:uuid, preservedOriginalExerciseInstanceId:uuid } }`
-  - Mutation rule: future-plan applies by creating replacement `exercise_instance` row and retiring original from future view; session override writes to `session_exercise_override` view/RPC result only. Completed workout history and completed set logs are never rewritten.
+All exposed mutable entities include `versionToken` in API: `userProfile`, `goalPlan`, `equipmentProfile`, `userExercisePreference`, `userLimitation`, `notificationPreference`, `planVersion`, `workoutSession`, `postWorkoutCheckIn`, `recommendation`.
 
-### 3.C.7 Recommendation action ignoredReason other text
-- `POST /v1/recommendations/{id}/ignore` request extends to `{ versionToken:number, ignoredReason:enum, ignoredReasonText?:string|null }`; `ignoredReasonText` required when `ignoredReason='other'`.
+---
 
-### 3.C.8 Transaction/RPC notes for endpoint groups
-- Workout-session status transitions are RPC-only (`rpc_transition_workout_session`).
-- Recommendation accept/ignore/dismiss are RPC-only (`rpc_apply_recommendation_action`).
-- Set logs are append/idempotent insert only via RPC (`rpc_append_set_logs`); no client update/delete contract.
+
+## 8.1 MVP analytics and trust-validation contract
+
+Event allowlist (only these events permitted in MVP analytics pipeline):
+- `recommendation_why_expanded`
+- `recommendation_why_then_accepted`
+- `recommendation_accepted`
+- `recommendation_ignored`
+- `trust_survey_submitted`
+- `onboarding_abandoned_with_plan`
+- `missed_workout_action_selected`
+
+PII/sensitive boundaries (hard deny, never emitted):
+- body weight values
+- pain notes
+- workout notes
+- email/name
+- exact age
+- exact height
+- soreness/pain location specifics
+
+Analytics preference support:
+- Add `analytics_opt_out boolean not null default false` to `user_profile` API/DB contract; if true, no analytics events are emitted for that user except strictly required operational security logs outside product analytics.
+
+Trust survey capture (week-4 metric minimum contract):
+- `POST /v1/trust-survey` request `{ versionToken:number, weekIndex:4, trustRating:1..5, submittedAt:timestamptz }` and response with incremented `versionToken`.
+- Persist minimal record in `trust_survey_response` (`id`, `user_id`, `week_index`, `trust_rating`, `submitted_at`, `created_at`) for metric calculation; no free-text required in MVP.
+
+## 9) Open decisions inherited from PRD
+
+Blocking decisions outside this contract (if unresolved in PRD) must remain flagged:
+- legal/privacy deletion policy and retention text (blocking production data lifecycle implementation).
+- final safety disclaimer copy.
+- Apple/Google sign-in decision.
+- final exercise seed list contents (contract keeps ~80 guidance until finalized list is approved).
+- pricing validation.
+- WCAG audit cadence and accessibility QA owner assignment.
+- §5.5 content author and reviewer confirmation before build week 1.
+- recommendation `triggerFactors/inputsUsed` bounded MVP schema approval if PRD edits are pending.
+
+---
+
+## 10) Implementation readiness checklist
+
+### A) Contract-complete for engineering estimation
+- [x] All MVP schemas fully defined (columns/types/nullability/defaults/enums/FKs/uniques/checks/indexes/ownership/versioning/API mapping).
+- [x] All endpoints include method/path/auth/headers/request-success-errors/versionToken/idempotency/RLS/transaction notes.
+- [x] Regeneration and local-draft safety matrix fully specified.
+
+### B) Architecture-freeze ready
+- [x] RLS/FK/trigger/RPC enforcement finalized with explicit per-table permissions and domain errors.
+- [x] Acceptance tests mapped to high-risk flows and invariants.
+- [ ] All §9 PRD open decisions closed (required before architecture-freeze can be marked complete).
+- [x] PRD open decisions explicitly listed as blockers while unresolved.
+
+### C) Production implementation ready
+- [ ] PRD §0 pre-build gates are passed and signed off; production implementation remains blocked until this is true.
+- [ ] Migration DDL generated exactly from this contract.
+- [ ] RPCs implement all state transitions and idempotency semantics.
+- [ ] Integration/e2e suite passes all §6 tests in CI.
+- [x] No placeholder language remains.
+
+
+## 11) Patch Summary
+- Sections amended: §1 status, §2.6 (`cue_safety_note` nullability), §2.16 (`soreness_location` nullability + API consistency), §3 ownership/error invariants and normative integration statement, §5.A explicit per-table RLS matrix, §10 readiness checklist.
+- Sections added: §2.18 `exercise_substitution` persistence model (future-plan + session-level substitution with FK/ownership/versioning/immutability semantics).
+- Sections moved: former §3.A/§3.B/§3.C merged into §3.12–§3.14; former §5.A merged into §5.1; former §6.A merged into §6.1 with cross-reference updates.
+- Sections deleted: none. No implementation-critical schema/API/RLS/sync/state-machine/generator/progression/acceptance-test content was removed.
+- Remaining blockers before production implementation readiness: §10.C items (migration generation, RPC implementation, CI e2e pass, PRD pre-build gates) remain execution tasks and are intentionally unchecked.
+
